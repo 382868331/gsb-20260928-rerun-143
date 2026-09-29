@@ -1,0 +1,41 @@
+{
+  "format": "gamesave",
+  "format_version": 1,
+  "objects": [
+    {
+      "id": 0,
+      "type": "player",
+      "version": 1,
+      "fields": {
+        "name": "Alden",
+        "gold": 250,
+        "home": {"kind": "ref", "id": 1},
+        "friends": [{"kind": "ref", "id": 2}]
+      }
+    },
+    {
+      "id": 1,
+      "type": "chest",
+      "version": 1,
+      "fields": {
+        "label": "Old Sea Chest",
+        "items": {"rope": 2, "torch": 5},
+        "owner": {"kind": "ref", "id": 0}
+      }
+    },
+    {
+      "id": 2,
+      "type": "player",
+      "version": 1,
+      "fields": {
+        "name": "Mira",
+        "gold": 90,
+        "home": null,
+        "friends": []
+      }
+    }
+  ],
+  "roots": {
+    "hero": {"kind": "ref", "id": 0}
+  }
+}
