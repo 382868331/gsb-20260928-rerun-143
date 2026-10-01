@@ -12,8 +12,9 @@ import (
 // Item is a relic that can be carried by several players at once
 // (shared object identity across the graph).
 type Item struct {
-	ID    string
-	Power int
+	ID            string
+	Power         int
+	FavoriteOwner *Player
 }
 
 // Player is the current (version 2) shape.

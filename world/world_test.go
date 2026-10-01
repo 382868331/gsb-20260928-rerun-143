@@ -33,6 +33,7 @@ func buildWorld() *world.Player {
 	guild := &world.Guild{Name: "Cartographers", Leader: leader, Members: []*world.Player{leader, rival}}
 	leader.Guild = guild
 	rival.Guild = guild
+	relic.FavoriteOwner = leader
 	return leader
 }
 

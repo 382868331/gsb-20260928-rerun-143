@@ -188,6 +188,7 @@ func (r *Registry) Decode(raw []byte) (any, error) {
 		return nil, fmt.Errorf("savecore: unsupported format version %d (want %d)", env.FormatVer, formatVersion)
 	}
 	d := &decoder{reg: r, table: map[int]reflect.Value{}}
+	d.filled = map[int]bool{}
 	root, err := d.decodeRef(json.RawMessage(env.Root))
 	if err != nil {
 		return nil, err
@@ -199,8 +200,25 @@ func (r *Registry) Decode(raw []byte) (any, error) {
 }
 
 type decoder struct {
-	reg   *Registry
-	table map[int]reflect.Value
+	reg    *Registry
+	table  map[int]reflect.Value
+	filled map[int]bool
+}
+
+func (d *decoder) placeholder(typeName string, id int) (reflect.Value, error) {
+	if existing, ok := d.table[id]; ok {
+		return existing, nil
+	}
+	c, err := d.reg.codec(typeName)
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	v := reflect.ValueOf(c.New())
+	d.table[id] = v
+	if d.filled == nil {
+		d.filled = map[int]bool{}
+	}
+	return v, nil
 }
 
 // decodeRef builds (or returns) the object represented by a raw node
@@ -229,8 +247,38 @@ func (d *decoder) decodeRef(raw json.RawMessage) (reflect.Value, error) {
 	}
 	id := *probe.ID
 	if existing, ok := d.table[id]; ok {
-		return existing, nil
+		return d.decodeRegisteredNode(raw, id, existing)
 	}
+	return d.decodeNewNode(raw, &probe, id)
+}
+
+func (d *decoder) decodeRegisteredNode(raw json.RawMessage, id int, inst reflect.Value) (reflect.Value, error) {
+	if d.filled[id] {
+		return reflect.Value{}, fmt.Errorf("savecore: node $id:%d is defined more than once", id)
+	}
+	var probe struct {
+		Type string `json:"$type"`
+		Ver  int    `json:"$ver"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return reflect.Value{}, fmt.Errorf("savecore: malformed node: %w", err)
+	}
+	if probe.Type == "" {
+		return reflect.Value{}, fmt.Errorf("savecore: node $id:%d missing %q", id, keyType)
+	}
+	if err := d.fillRegisteredNode(raw, id, probe.Type, probe.Ver, inst); err != nil {
+		return reflect.Value{}, err
+	}
+	return inst, nil
+}
+
+func (d *decoder) decodeNewNode(raw json.RawMessage, probe *struct {
+	ID   *int   `json:"$id"`
+	Ref  *int   `json:"$ref"`
+	Type string `json:"$type"`
+	Ver  int    `json:"$ver"`
+	Data any    `json:"data"`
+}, id int) (reflect.Value, error) {
 	if probe.Type == "" {
 		return reflect.Value{}, fmt.Errorf("savecore: node $id:%d missing %q", id, keyType)
 	}
@@ -243,33 +291,47 @@ func (d *decoder) decodeRef(raw json.RawMessage) (reflect.Value, error) {
 	}
 	inst := reflect.ValueOf(c.New())
 	d.table[id] = inst
+	if err := d.fillRegisteredNode(raw, id, probe.Type, probe.Ver, inst); err != nil {
+		return reflect.Value{}, err
+	}
+	return inst, nil
+}
 
+func (d *decoder) fillRegisteredNode(raw json.RawMessage, id int, typeName string, ver int, inst reflect.Value) error {
 	var rawData map[string]json.RawMessage
 	wrapper := struct {
 		D map[string]json.RawMessage `json:"data"`
 	}{D: rawData}
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
-		return reflect.Value{}, fmt.Errorf("savecore: node %s: malformed data: %w", probe.Type, err)
+		return fmt.Errorf("savecore: node %s: malformed data: %w", typeName, err)
 	}
 	rawData = wrapper.D
 	data := map[string]any{}
 	for k, v := range rawData {
 		var x any
 		if err := json.Unmarshal(v, &x); err != nil {
-			return reflect.Value{}, fmt.Errorf("savecore: node %s field %s: %w", probe.Type, k, err)
+			return fmt.Errorf("savecore: node %s field %s: %w", typeName, k, err)
 		}
 		data[k] = x
 	}
-	if probe.Ver != c.Version {
-		data, err = d.reg.migrateTo(probe.Type, probe.Ver, data)
+	if ver < 1 {
+		return fmt.Errorf("savecore: node %q has invalid version %d", typeName, ver)
+	}
+	c, err := d.reg.codec(typeName)
+	if err != nil {
+		return err
+	}
+	if ver != c.Version {
+		data, err = d.reg.migrateTo(typeName, ver, data)
 		if err != nil {
-			return reflect.Value{}, err
+			return err
 		}
 	}
 	if err := d.fillStruct(inst.Elem(), data); err != nil {
-		return reflect.Value{}, fmt.Errorf("node %s: %w", probe.Type, err)
+		return fmt.Errorf("node %s: %w", typeName, err)
 	}
-	return inst, nil
+	d.filled[id] = true
+	return nil
 }
 
 // decodeNode handles a value known to be a node or ref (pointer
