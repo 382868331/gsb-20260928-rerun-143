@@ -22,6 +22,13 @@ const (
 // serialization. Every registered object must be a *struct; shared
 // pointers become one node plus refs, cycles are supported.
 func (r *Registry) Encode(root any) ([]byte, error) {
+	return r.EncodeWithHook(root, nil)
+}
+
+// EncodeWithHook is Encode plus a callback fired for every object
+// node, in first-visit order. Branch uses it to attach stable
+// identities without a second graph walk.
+func (r *Registry) EncodeWithHook(root any, hook func(obj any, id int)) ([]byte, error) {
 	if root == nil {
 		return nil, fmt.Errorf("savecore: cannot encode nil root")
 	}
@@ -33,6 +40,7 @@ func (r *Registry) Encode(root any) ([]byte, error) {
 		reg:   r,
 		seen:  map[ptrKey]int{},
 		types: map[reflect.Type]string{},
+		hook:  hook,
 	}
 	for name, c := range r.codecs {
 		e.types[reflect.TypeOf(c.New()).Elem()] = name
@@ -54,6 +62,7 @@ type encoder struct {
 	seen  map[ptrKey]int
 	types map[reflect.Type]string
 	next  int
+	hook  func(obj any, id int)
 }
 
 // ptrKey identifies a pointer: reflect.Value itself must not be used
@@ -77,6 +86,9 @@ func (e *encoder) encodePtr(rv reflect.Value) (map[string]any, error) {
 	e.next++
 	id := e.next
 	e.seen[key] = id
+	if e.hook != nil {
+		e.hook(rv.Interface(), id)
+	}
 	c := e.reg.codecs[name]
 	data, err := e.encodeStruct(rv.Elem())
 	if err != nil {
@@ -173,6 +185,13 @@ func (e *encoder) encodeValue(rv reflect.Value) (any, error) {
 // Only registered types are instantiated; unknown types and dangling
 // references are errors.
 func (r *Registry) Decode(raw []byte) (any, error) {
+	return r.DecodeWithHook(raw, nil)
+}
+
+// DecodeWithHook is Decode plus a callback fired as each object is
+// registered, before its fields are filled. Branch uses it to
+// reconnect stable identities to live pointers after a load.
+func (r *Registry) DecodeWithHook(raw []byte, hook func(obj any, id int)) (any, error) {
 	var env struct {
 		Format    string          `json:"format"`
 		FormatVer int             `json:"formatVer"`
@@ -187,7 +206,18 @@ func (r *Registry) Decode(raw []byte) (any, error) {
 	if env.FormatVer != formatVersion {
 		return nil, fmt.Errorf("savecore: unsupported format version %d (want %d)", env.FormatVer, formatVersion)
 	}
-	d := &decoder{reg: r, table: map[int]reflect.Value{}}
+	d := &decoder{reg: r, table: map[int]reflect.Value{}, filled: map[int]bool{}, hook: hook}
+	// Pass 1: register a zero instance for every node in the
+	// document, so pass 2 resolves $ref regardless of the order
+	// nodes appear in (merged saves emit nodes in graph order,
+	// which is not necessarily struct field order).
+	var rootAny any
+	if err := json.Unmarshal(env.Root, &rootAny); err != nil {
+		return nil, fmt.Errorf("savecore: malformed root: %w", err)
+	}
+	if err := d.preRegister(rootAny); err != nil {
+		return nil, err
+	}
 	root, err := d.decodeRef(json.RawMessage(env.Root))
 	if err != nil {
 		return nil, err
@@ -199,8 +229,69 @@ func (r *Registry) Decode(raw []byte) (any, error) {
 }
 
 type decoder struct {
-	reg   *Registry
-	table map[int]reflect.Value
+	reg    *Registry
+	table  map[int]reflect.Value
+	filled map[int]bool
+	hook   func(obj any, id int)
+}
+
+// preRegister walks the decoded JSON tree and registers a zero
+// instance for every object node, before any field is filled.
+func (d *decoder) preRegister(v any) error {
+	switch t := v.(type) {
+	case map[string]any:
+		if _, isRef := t[keyRef]; isRef {
+			return nil
+		}
+		idRaw, isNode := t[keyID]
+		if !isNode {
+			for _, x := range t {
+				if err := d.preRegister(x); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		idf, ok := idRaw.(float64)
+		if !ok {
+			return fmt.Errorf("savecore: node %q is not a number", keyID)
+		}
+		id := int(idf)
+		if _, ok := d.table[id]; !ok {
+			typ, _ := t[keyType].(string)
+			if typ == "" {
+				return fmt.Errorf("savecore: node $id:%d missing %q", id, keyType)
+			}
+			c, err := d.reg.codec(typ)
+			if err != nil {
+				return err
+			}
+			ver, _ := t[keyVer].(float64)
+			if ver < 1 {
+				return fmt.Errorf("savecore: node %q has invalid version %d", typ, int(ver))
+			}
+			inst := reflect.ValueOf(c.New())
+			d.table[id] = inst
+			if d.hook != nil {
+				d.hook(inst.Interface(), id)
+			}
+		}
+		if data, ok := t[keyData].(map[string]any); ok {
+			for _, x := range data {
+				if err := d.preRegister(x); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	case []any:
+		for _, x := range t {
+			if err := d.preRegister(x); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // decodeRef builds (or returns) the object represented by a raw node
@@ -228,21 +319,18 @@ func (d *decoder) decodeRef(raw json.RawMessage) (reflect.Value, error) {
 		return reflect.Value{}, fmt.Errorf("savecore: node missing %q", keyID)
 	}
 	id := *probe.ID
-	if existing, ok := d.table[id]; ok {
-		return existing, nil
+	inst, ok := d.table[id]
+	if !ok {
+		return reflect.Value{}, fmt.Errorf("savecore: node $id:%d was not pre-registered", id)
 	}
-	if probe.Type == "" {
-		return reflect.Value{}, fmt.Errorf("savecore: node $id:%d missing %q", id, keyType)
+	if d.filled[id] {
+		return inst, nil
 	}
+	d.filled[id] = true
 	c, err := d.reg.codec(probe.Type)
 	if err != nil {
 		return reflect.Value{}, err
 	}
-	if probe.Ver < 1 {
-		return reflect.Value{}, fmt.Errorf("savecore: node %q has invalid version %d", probe.Type, probe.Ver)
-	}
-	inst := reflect.ValueOf(c.New())
-	d.table[id] = inst
 
 	var rawData map[string]json.RawMessage
 	wrapper := struct {

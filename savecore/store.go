@@ -56,11 +56,18 @@ func (s *Store) TempPath() string {
 }
 
 // Save encodes root and publishes the file atomically.
-func (s *Store) Save(root any) (err error) {
+func (s *Store) Save(root any) error {
 	payload, err := s.reg.Encode(root)
 	if err != nil {
 		return err
 	}
+	return s.SavePayload(payload)
+}
+
+// SavePayload publishes an already-encoded graph payload with the
+// same atomic temp-file-then-rename protocol as Save. Merge uses it
+// to write a graph assembled from several candidates.
+func (s *Store) SavePayload(payload []byte) (err error) {
 	frame, err := pack(payload)
 	if err != nil {
 		return err
