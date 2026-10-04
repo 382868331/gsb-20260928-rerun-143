@@ -24,13 +24,14 @@ type PendingObject struct {
 }
 
 // PendingReference records a reference whose target would have
-// vanished; the base version of the target was rescued so the merged
+// vanished; the target was rescued (from the base save, or from the
+// candidate that introduced it when it is branch-new) so the merged
 // save has neither duplicates nor dangling targets.
 type PendingReference struct {
 	From    string `json:"from"`
 	To      string `json:"to"`
 	ToType  string `json:"toType"`
-	Rescued string `json:"rescued"` // "base"
+	Rescued string `json:"rescued"` // "base", "A" or "B"
 }
 
 // MergeReport states exactly what a finalized merge did and left out.
@@ -329,12 +330,49 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 					continue
 				}
 				bs := m.base.states[target]
+				rescued := "base"
+				var rescueSrc *candidate = m.base
 				if bs == nil {
-					return nil, fmt.Errorf("savecore: reference %s -> %s has no base version to rescue", sid, target)
+					// Branch-new target with no base version to fall back
+					// to: rescue the version from the candidate whose
+					// chosen reference points at it, instead of silently
+					// dropping the object. Prefer the reference's own side
+					// so the graph stays internally consistent.
+					var src *candidate
+					switch cs.side {
+					case "A":
+						src = m.a
+						rescued = "A"
+					case "B":
+						src = m.b
+						rescued = "B"
+					default:
+						if m.a.states[target] != nil {
+							src = m.a
+							rescued = "A"
+						} else {
+							src = m.b
+							rescued = "B"
+						}
+					}
+					if src == nil {
+						src = m.a
+						rescued = "A"
+					}
+					bs = src.states[target]
+					if bs == nil {
+						src = m.b
+						rescued = "B"
+						bs = src.states[target]
+					}
+					if bs == nil {
+						return nil, fmt.Errorf("savecore: reference %s -> %s has no rescue source", sid, target)
+					}
+					rescueSrc = src
 				}
-				chosen[target] = &chosenState{state: bs, source: m.base, side: "base"}
+				chosen[target] = &chosenState{state: bs, source: rescueSrc, side: rescued}
 				report.PendingReferences = append(report.PendingReferences, PendingReference{
-					From: sid, To: target, ToType: bs.Type, Rescued: "base",
+					From: sid, To: target, ToType: bs.Type, Rescued: rescued,
 				})
 				report.Complete = false
 				missing = true
@@ -376,6 +414,23 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 		report.AdoptedRegions = append(report.AdoptedRegions, r)
 	}
 	sort.Strings(report.AdoptedRegions)
+	// A branch-new object first listed as an unadopted exclusion may
+	// have been pulled back in by the reference-rescue pass; keep one
+	// consistent story instead of reporting it both excluded and kept.
+	if len(report.PendingReferences) > 0 {
+		rescued := map[string]bool{}
+		for _, pr := range report.PendingReferences {
+			rescued[pr.To] = true
+		}
+		kept := report.PendingObjects[:0]
+		for _, po := range report.PendingObjects {
+			if po.Kept == "excluded" && rescued[po.StableID] {
+				continue
+			}
+			kept = append(kept, po)
+		}
+		report.PendingObjects = kept
+	}
 	sort.Slice(report.PendingObjects, func(i, j int) bool {
 		return report.PendingObjects[i].StableID < report.PendingObjects[j].StableID
 	})

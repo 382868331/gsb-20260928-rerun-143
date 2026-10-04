@@ -632,3 +632,323 @@ func TestUndoRegionAdoption(t *testing.T) {
 		t.Fatalf("undone adoption leaked into save: level = %d", got)
 	}
 }
+
+// TestBranchNewObjectsGetDistinctIdentities: objects newly added in
+// two branches must never share a stable id just because they are the
+// first object each branch minted. The scenario also covers a shared
+// object moved in one branch, a delete-vs-modify conflict, rescue of
+// a branch-new reference target with no base version, resume after a
+// save/reopen, and undoing one region retracting only its references.
+func TestBranchNewObjectsGetDistinctIdentities(t *testing.T) {
+	dir := t.TempDir()
+	base := saveBase(t, dir)
+
+	// Branch A: adds a new northern relic (carried by Ada), removes
+	// the shared relic completely (both carriers and the region list),
+	// and levels Ada.
+	a := editBranch(t, base, filepath.Join(dir, "a.sv"), func(w *world.World) {
+		north := w.FindRegion("north")
+		echo := &world.Item{ID: "Echo", Power: 1}
+		ada := north.Players[0]
+		north.Items = []*world.Item{echo}
+		ada.Inventory = []*world.Item{echo}
+		w.FindRegion("south").Players[0].Inventory = nil
+		ada.Level = 10
+	})
+
+	// Branch B: adds a distinct southern relic with the SAME game id
+	// "Echo", carried by Bo, and powers the shared relic up.
+	b := editBranch(t, base, filepath.Join(dir, "b.sv"), func(w *world.World) {
+		south := w.FindRegion("south")
+		echo := &world.Item{ID: "Echo", Power: 2}
+		south.Items = append(south.Items, echo)
+		w.FindRegion("north").Items[0].Power = 100 // modify shared relic
+		// Move a shared/cross-region object: Bo joins the north region
+		// while keeping his guild and southern cross-references.
+		bo := south.Players[0]
+		south.Players = nil
+		w.FindRegion("north").Players = append(w.FindRegion("north").Players, bo)
+	})
+
+	// The two "Echo" items must have different stable identities.
+	ma, err := savecore.LoadManifest(savecore.ManifestPath(a.Path))
+	if err != nil {
+		t.Fatalf("load A manifest: %v", err)
+	}
+	mb, err := savecore.LoadManifest(savecore.ManifestPath(b.Path))
+	if err != nil {
+		t.Fatalf("load B manifest: %v", err)
+	}
+	itemIDs := func(m *savecore.Manifest) map[string]bool {
+		out := map[string]bool{}
+		for sid, meta := range m.Objects {
+			if meta.Type == "world.Item" {
+				out[sid] = true
+			}
+		}
+		return out
+	}
+	mbase, err := savecore.LoadManifest(savecore.ManifestPath(base.Path))
+	if err != nil {
+		t.Fatalf("load base manifest: %v", err)
+	}
+	newInA, newInB := itemIDs(ma), itemIDs(mb)
+	// Ids shared with the base are inherited identities (the relic);
+	// every genuinely new id must be branch-unique.
+	for sid := range newInA {
+		if newInB[sid] && mbase.Objects[sid] == nil {
+			t.Fatalf("branch-new objects collided on stable id %s", sid)
+		}
+	}
+
+	out := savecore.NewStore(world.Registry(), filepath.Join(dir, "merged.sv"))
+	m := newSession(t, base, a, b, out)
+
+	// Locate diff rows for the relic (delete-modify) and both Echo items.
+	var relicRow, echoARow, echoB *savecore.ObjectDiff
+	for _, od := range m.Diff().Objects {
+		if od.Type != "world.Item" {
+			continue
+		}
+		switch {
+		case od.KindA == savecore.Deleted || od.KindB == savecore.Deleted:
+			relicRow = od
+		case od.KindA == savecore.Added:
+			echoARow = od
+		case od.KindB == savecore.Added:
+			echoB = od
+		}
+	}
+	if relicRow == nil || relicRow.Conflict != "delete-modify" {
+		t.Fatalf("shared relic should be a delete-modify row: %+v", relicRow)
+	}
+	if echoARow == nil || echoB == nil || echoARow.StableID == echoB.StableID {
+		t.Fatalf("two Echo items must be separate additions: %+v %+v", echoARow, echoB)
+	}
+	if echoARow.Region != "north" || echoB.Region != "south" {
+		t.Fatalf("echo regions wrong: %q %q", echoARow.Region, echoB.Region)
+	}
+
+	// South is conflict-free and adopts first; its brand-new Echo has
+	// no base version and must survive Finalize without an error.
+	clean := m.CleanRegions()
+	var southClean bool
+	for _, r := range clean {
+		if r == "south" {
+			southClean = true
+		}
+	}
+	if !southClean {
+		t.Fatalf("south must be clean: %v", clean)
+	}
+	if err := m.AdoptRegion("south"); err != nil {
+		t.Fatalf("AdoptRegion(south): %v", err)
+	}
+
+	report, err := m.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize with branch-new target: %v", err)
+	}
+	if report.Complete {
+		t.Fatal("partial merge must not claim completeness")
+	}
+	// The unadopted north must stay explicit: nothing is silently lost.
+	var sawNorthPending bool
+	for _, po := range report.PendingObjects {
+		if po.Region == "north" {
+			sawNorthPending = true
+		}
+	}
+	if !sawNorthPending {
+		t.Fatalf("unadopted north objects missing from report: %+v", report.PendingObjects)
+	}
+
+	// The save written at this checkpoint must load and contain B's
+	// brand-new Echo under its own identity (simulates save/reopen).
+	checkpoint := loadWorld(t, out)
+	south := checkpoint.FindRegion("south")
+	if len(south.Items) != 1 || south.Items[0].ID != "Echo" || south.Items[0].Power != 2 {
+		t.Fatalf("branch B Echo lost at checkpoint: %+v", south.Items)
+	}
+
+	// Reopen the merge from its persisted state and finish it.
+	resumed, err := savecore.ResumeMergeSession(world.Registry(), base, a, b, out)
+	if err != nil {
+		t.Fatalf("ResumeMergeSession: %v", err)
+	}
+	// Resolve the relic conflict in B's favour and adopt the rest.
+	var relicID string
+	for _, od := range resumed.Diff().Objects {
+		if od.Type == "world.Item" && (od.KindA == savecore.Deleted || od.KindB == savecore.Deleted) {
+			relicID = od.StableID
+		}
+	}
+	if err := resumed.Resolve(relicID, savecore.SideB); err != nil {
+		t.Fatalf("Resolve relic: %v", err)
+	}
+	// Ada is modified on A while B left her at base -> clean via A.
+	for _, region := range resumed.CleanRegions() {
+		if err := resumed.AdoptRegion(region); err != nil {
+			t.Fatalf("AdoptRegion(%q) after resume: %v", region, err)
+		}
+	}
+	// Any remaining object-level conflict (e.g. bo modify/modify via relic).
+	for _, od := range resumed.Pending() {
+		if od.Conflict != "" {
+			side := savecore.SideA
+			if od.KindB != savecore.Unchanged {
+				side = savecore.SideB
+			}
+			if err := resumed.Resolve(od.StableID, side); err != nil {
+				t.Fatalf("Resolve %s: %v", od.StableID, err)
+			}
+		}
+	}
+	for _, region := range resumed.CleanRegions() {
+		if err := resumed.AdoptRegion(region); err != nil {
+			t.Fatalf("final AdoptRegion(%q): %v", region, err)
+		}
+	}
+	report, err = resumed.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize after resume: %v", err)
+	}
+	if !report.Complete {
+		t.Fatalf("merge should complete after resolution: %+v", report)
+	}
+
+	merged := loadWorld(t, out)
+	northW, southW := merged.FindRegion("north"), merged.FindRegion("south")
+	// Two genuinely different Echo objects, one per region. A's Echo
+	// is carried by Ada; B's sits in the south region list.
+	if len(northW.Items) != 1 || northW.Items[0].ID != "Aegis-7" {
+		t.Fatalf("relic list wrong: %+v", northW.Items)
+	}
+	if len(southW.Items) != 1 || southW.Items[0].ID != "Echo" || southW.Items[0].Power != 2 {
+		t.Fatalf("B Echo wrong: %+v", southW.Items)
+	}
+	var echoA *world.Item
+	for _, it := range northW.Players[0].Inventory {
+		if it.ID == "Echo" {
+			echoA = it
+		}
+	}
+	if echoA == nil || echoA.Power != 1 {
+		t.Fatalf("A Echo wrong: %+v", northW.Players[0].Inventory)
+	}
+	if echoA == southW.Items[0] {
+		t.Fatal("distinct branch-new objects collapsed into one pointer")
+	}
+	// The shared relic survived as one object and carries B's
+	// modification; Bo moved into the north region and still carries it.
+	ada := northW.Players[0]
+	if len(southW.Players) != 0 {
+		t.Fatalf("Bo did not move out of south: %+v", southW.Players)
+	}
+	var bo *world.Player
+	for _, p := range northW.Players {
+		if p.Name == "Bo" {
+			bo = p
+		}
+	}
+	if bo == nil {
+		t.Fatal("moved Bo missing from north")
+	}
+	relic := northW.Items[0]
+	if relic.Power != 100 {
+		t.Fatalf("shared relic should carry B's power: %d", relic.Power)
+	}
+	var boHasRelic bool
+	for _, it := range bo.Inventory {
+		if it == relic {
+			boHasRelic = true
+		}
+	}
+	if !boHasRelic {
+		t.Fatal("relic duplicated instead of shared after merge")
+	}
+	if ada.Level != 10 {
+		t.Fatalf("A's ada edit lost: level %d", ada.Level)
+	}
+
+	// The merged manifest keeps the two branch-new objects under the
+	// distinct stable ids their branches minted.
+	mm, err := savecore.LoadManifest(savecore.ManifestPath(out.Path))
+	if err != nil {
+		t.Fatalf("merged manifest: %v", err)
+	}
+	itemIDCount := map[string]int{}
+	for _, sid := range mm.Nodes {
+		if mm.Objects[sid] != nil && mm.Objects[sid].Type == "world.Item" {
+			itemIDCount[sid]++
+		}
+	}
+	if len(itemIDCount) < 3 { // shared relic + two Echoes
+		t.Fatalf("merged manifest lost branch-new identities: %v", itemIDCount)
+	}
+	if !containsSID(itemIDCount, echoARow.StableID) || !containsSID(itemIDCount, echoB.StableID) {
+		t.Fatal("merged manifest dropped a branch-new stable id")
+	}
+
+	// Undo south: only south adoption and its reference consequences
+	// retract; the north content stays adopted.
+	if err := resumed.UndoRegion("south"); err != nil {
+		t.Fatalf("UndoRegion(south): %v", err)
+	}
+	report, err = resumed.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize after undo: %v", err)
+	}
+	if report.Complete {
+		t.Fatal("undo must leave the merge incomplete")
+	}
+	var echoBUndone bool
+	for _, po := range report.PendingObjects {
+		if po.StableID == echoB.StableID {
+			echoBUndone = true
+		}
+	}
+	if !echoBUndone {
+		t.Fatalf("B's Echo missing from pending after undo: %+v", report.PendingObjects)
+	}
+	merged = loadWorld(t, out)
+	north2 := merged.FindRegion("north")
+	if len(north2.Items) != 1 || north2.Items[0].ID != "Aegis-7" {
+		t.Fatalf("north relic list wrong after undo: %+v", north2.Items)
+	}
+	var echoAStillThere bool
+	for _, it := range north2.Players[0].Inventory {
+		if it.ID == "Echo" && it.Power == 1 {
+			echoAStillThere = true
+		}
+	}
+	if !echoAStillThere {
+		t.Fatalf("undo south retracted north content: %+v", north2.Players[0].Inventory)
+	}
+	south2 := merged.FindRegion("south")
+	if len(south2.Items) != 0 {
+		t.Fatalf("undone south Echo survived in output: %+v", south2.Items)
+	}
+
+	// Original candidates were never rewritten and remain recoverable.
+	wa := loadWorld(t, a)
+	if wa.FindRegion("north").Players[0].Level != 10 {
+		t.Fatal("candidate A changed by the merge")
+	}
+	wb := loadWorld(t, b)
+	var bRelic *world.Item
+	for _, p := range wb.FindRegion("north").Players {
+		if p.Name == "Bo" {
+			for _, it := range p.Inventory {
+				if it.ID == "Aegis-7" {
+					bRelic = it
+				}
+			}
+		}
+	}
+	if bRelic == nil || bRelic.Power != 100 {
+		t.Fatal("candidate B changed by the merge")
+	}
+}
+
+func containsSID(m map[string]int, sid string) bool { _, ok := m[sid]; return ok }

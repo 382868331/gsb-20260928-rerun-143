@@ -8,6 +8,8 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
+	"sync"
 )
 
 // Stable identity layer. A Branch is a working copy of a save taken
@@ -40,6 +42,41 @@ func newManifest() *Manifest {
 	return &Manifest{Objects: map[string]*ObjectMeta{}, Nodes: map[int]string{}}
 }
 
+// usedNonces tracks every nonce live in this process: a clone and a
+// later sibling both copy the same base, so a check against only the
+// base nonce would still let two independently minted nonces collide.
+var usedNonces = struct {
+	sync.Mutex
+	m map[string]bool
+}{m: map[string]bool{}}
+
+func registerNonce(nonce string) {
+	usedNonces.Lock()
+	usedNonces.m[nonce] = true
+	usedNonces.Unlock()
+}
+
+// mintNonce returns a fresh nonce that is neither in used (manifest
+// nonces already carried by this branch's copied id table) nor taken
+// by any other branch in the same process.
+func mintNonce(used map[string]bool) string {
+	for {
+		n := newNonce()
+		if used[n] {
+			continue
+		}
+		usedNonces.Lock()
+		collision := usedNonces.m[n]
+		if !collision {
+			usedNonces.m[n] = true
+		}
+		usedNonces.Unlock()
+		if !collision {
+			return n
+		}
+	}
+}
+
 // RegionOfFunc classifies a live object into a region name. Objects
 // the game does not place in any region get "".
 type RegionOfFunc func(obj any) string
@@ -50,14 +87,14 @@ type Branch struct {
 	store    *Store
 	regionOf RegionOfFunc
 	manifest *Manifest
-	ids      map[ptrKey]string // live pointer -> stable id
+	ids      *identityTokens // live object -> stable id
 }
 
 // Fork opens (or starts) a branch at store. If a save exists it must
 // already carry a manifest: branching from an unversioned file would
 // make up identities that the other candidate cannot share.
 func Fork(reg *Registry, store *Store, regionOf RegionOfFunc) (*Branch, error) {
-	b := &Branch{reg: reg, store: store, regionOf: regionOf, ids: map[ptrKey]string{}}
+	b := &Branch{reg: reg, store: store, regionOf: regionOf, ids: newIdentityTokens()}
 	exists, err := store.Exists()
 	if err != nil {
 		return nil, err
@@ -69,6 +106,9 @@ func Fork(reg *Registry, store *Store, regionOf RegionOfFunc) (*Branch, error) {
 	m, err := LoadManifest(ManifestPath(store.Path))
 	if err != nil {
 		return nil, fmt.Errorf("savecore: cannot branch from %s: %w", store.Path, err)
+	}
+	if m.Nonce != "" {
+		registerNonce(m.Nonce)
 	}
 	b.manifest = m
 	return b, nil
@@ -93,7 +133,43 @@ func CloneBranch(reg *Registry, src, dst *Store, regionOf RegionOfFunc) (*Branch
 	if err := os.WriteFile(ManifestPath(dst.Path), manifest, 0o644); err != nil {
 		return nil, fmt.Errorf("savecore: clone manifest: %w", err)
 	}
-	return Fork(reg, dst, regionOf)
+	b, err := Fork(reg, dst, regionOf)
+	if err != nil {
+		return nil, err
+	}
+	// Existing objects keep the stable ids they shared with the
+	// source, but ids minted after the fork must never collide with
+	// ids another sibling branch mints: give the clone its own
+	// nonce and restart its local counter. The copied id table is
+	// left untouched, so original objects still share identity.
+	// Every nonce embedded in a copied id is also taken: the clone
+	// starts past ids a sibling may mint from the same base.
+	used := map[string]bool{}
+	for sid := range b.manifest.Objects {
+		if n, ok := nonceOf(sid); ok {
+			used[n] = true
+		}
+	}
+	b.manifest.Nonce = mintNonce(used)
+	b.manifest.Seq = 0
+	if err := b.manifest.save(ManifestPath(dst.Path)); err != nil {
+		return nil, fmt.Errorf("savecore: clone manifest nonce: %w", err)
+	}
+	return b, nil
+}
+
+// nonceOf extracts the nonce part of a minted stable id
+// "obj-<nonce>-<6-digit seq>".
+func nonceOf(sid string) (string, bool) {
+	if !strings.HasPrefix(sid, "obj-") {
+		return "", false
+	}
+	rest := sid[len("obj-"):]
+	i := strings.LastIndex(rest, "-")
+	if i <= 0 || len(rest)-i-1 != 6 {
+		return "", false
+	}
+	return rest[:i], true
 }
 
 // ManifestPath is where the identity manifest of a save file lives.
@@ -172,21 +248,26 @@ func (b *Branch) Save(root any) error {
 func (b *Branch) Manifest() *Manifest { return b.manifest }
 
 func (b *Branch) stableID(obj any) string {
-	key := ptrKeyOf(obj)
-	if sid, ok := b.ids[key]; ok {
+	if sid, ok := b.ids.get(obj); ok {
 		return sid
 	}
 	if b.manifest.Nonce == "" {
-		b.manifest.Nonce = newNonce()
+		used := map[string]bool{}
+		for sid := range b.manifest.Objects {
+			if n, ok := nonceOf(sid); ok {
+				used[n] = true
+			}
+		}
+		b.manifest.Nonce = mintNonce(used)
 	}
 	b.manifest.Seq++
 	sid := fmt.Sprintf("obj-%s-%06d", b.manifest.Nonce, b.manifest.Seq)
-	b.ids[key] = sid
+	b.ids.put(obj, sid)
 	return sid
 }
 
 func (b *Branch) remember(obj any, sid string) {
-	b.ids[ptrKeyOf(obj)] = sid
+	b.ids.put(obj, sid)
 }
 
 func (b *Branch) typeName(obj any) string {
@@ -199,15 +280,11 @@ func (b *Branch) typeName(obj any) string {
 	return t.String()
 }
 
-func ptrKeyOf(obj any) ptrKey {
-	rv := reflect.ValueOf(obj)
-	return ptrKey{ptr: rv.Pointer(), typ: rv.Elem().Type()}
-}
-
-// newNonce returns a random hex tag so two branches forked from one
-// save point never mint the same stable id for different objects.
+// newNonce returns a random 128-bit hex tag so two branches forked
+// from one save point never mint the same stable id for different
+// objects (the clone check excludes already-used nonces as well).
 func newNonce() string {
-	var buf [4]byte
+	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		panic(err)
 	}

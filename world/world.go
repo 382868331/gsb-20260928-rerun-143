@@ -53,6 +53,12 @@ type World struct {
 // attributed to the first; objects only reachable by reference are
 // unregioned ("").
 func (w *World) RegionOf(obj any) string {
+	// A region container belongs to the region it defines, so that
+	// adopting or undoing a region also covers reference decisions
+	// stored on the container itself (its Players/Guilds/Items lists).
+	if r, ok := obj.(*Region); ok {
+		return r.Name
+	}
 	for _, r := range w.Regions {
 		for _, p := range r.Players {
 			if p == obj {
