@@ -127,6 +127,18 @@ func (r *Registry) migrateTo(name string, ver int, data map[string]any) (map[str
 	return data, nil
 }
 
+// MigrateData upgrades a raw saved data payload of type "name" from
+// version "ver" to the codec's current version. It exposes migrateTo
+// for tools that compare saves at the data level without
+// instantiating objects; the input map is not modified.
+func (r *Registry) MigrateData(name string, ver int, data map[string]any) (map[string]any, error) {
+	copied := make(map[string]any, len(data))
+	for k, v := range data {
+		copied[k] = v
+	}
+	return r.migrateTo(name, ver, copied)
+}
+
 // TypeNames returns registered type names, for diagnostics.
 func (r *Registry) TypeNames() []string {
 	names := make([]string, 0, len(r.codecs))

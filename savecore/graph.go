@@ -169,6 +169,40 @@ func (e *encoder) encodeValue(rv reflect.Value) (any, error) {
 	}
 }
 
+// UnpackEnvelope validates a save envelope and returns the raw root
+// node. Tooling that operates on the graph JSON directly (diff and
+// merge) uses this instead of Decode, which instantiates objects.
+func UnpackEnvelope(payload []byte) (json.RawMessage, error) {
+	var env struct {
+		Format    string          `json:"format"`
+		FormatVer int             `json:"formatVer"`
+		Root      json.RawMessage `json:"root"`
+	}
+	if err := json.Unmarshal(payload, &env); err != nil {
+		return nil, fmt.Errorf("savecore: malformed save: %w", err)
+	}
+	if env.Format != formatName {
+		return nil, fmt.Errorf("savecore: not a savecore file (format=%q)", env.Format)
+	}
+	if env.FormatVer != formatVersion {
+		return nil, fmt.Errorf("savecore: unsupported format version %d (want %d)", env.FormatVer, formatVersion)
+	}
+	if len(env.Root) == 0 {
+		return nil, fmt.Errorf("savecore: save has no root node")
+	}
+	return env.Root, nil
+}
+
+// MarshalEnvelope wraps an already-built root node in the save
+// envelope. It is the inverse of UnpackEnvelope.
+func MarshalEnvelope(root map[string]any) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"format":    formatName,
+		"formatVer": formatVersion,
+		"root":      root,
+	})
+}
+
 // Decode parses a save envelope and reconstructs the object graph.
 // Only registered types are instantiated; unknown types and dangling
 // references are errors.
@@ -187,7 +221,10 @@ func (r *Registry) Decode(raw []byte) (any, error) {
 	if env.FormatVer != formatVersion {
 		return nil, fmt.Errorf("savecore: unsupported format version %d (want %d)", env.FormatVer, formatVersion)
 	}
-	d := &decoder{reg: r, table: map[int]reflect.Value{}}
+	d := &decoder{reg: r, table: map[int]reflect.Value{}, filled: map[int]bool{}}
+	if err := d.preregister(json.RawMessage(env.Root)); err != nil {
+		return nil, err
+	}
 	root, err := d.decodeRef(json.RawMessage(env.Root))
 	if err != nil {
 		return nil, err
@@ -201,6 +238,61 @@ func (r *Registry) Decode(raw []byte) (any, error) {
 type decoder struct {
 	reg   *Registry
 	table map[int]reflect.Value
+	// filled marks nodes whose fields have been decoded already;
+	// preregistered nodes are in table but not yet filled.
+	filled map[int]bool
+}
+
+// preregister scans the raw graph and registers a zero instance
+// for every node before any field is filled. References may then
+// point at nodes whose data appears later in the document (a
+// merged save gathers nodes from several sources, so it cannot
+// always order definitions before uses); a reference to an id
+// that exists nowhere is still a dangling-reference error.
+func (d *decoder) preregister(raw json.RawMessage) error {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return fmt.Errorf("savecore: malformed node: %w", err)
+	}
+	var walk func(any) error
+	walk = func(v any) error {
+		switch t := v.(type) {
+		case map[string]any:
+			if _, isRef := t[keyRef]; isRef {
+				return nil
+			}
+			if idf, isNode := t[keyID]; isNode {
+				id, ok := idf.(float64)
+				if !ok {
+					return fmt.Errorf("savecore: malformed node $id")
+				}
+				if _, seen := d.table[int(id)]; !seen {
+					name, _ := t[keyType].(string)
+					if name == "" {
+						return fmt.Errorf("savecore: node $id:%d missing %q", int(id), keyType)
+					}
+					c, err := d.reg.codec(name)
+					if err != nil {
+						return err
+					}
+					d.table[int(id)] = reflect.ValueOf(c.New())
+				}
+			}
+			for _, e := range t {
+				if err := walk(e); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, e := range t {
+				if err := walk(e); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(v)
 }
 
 // decodeRef builds (or returns) the object represented by a raw node
@@ -228,7 +320,7 @@ func (d *decoder) decodeRef(raw json.RawMessage) (reflect.Value, error) {
 		return reflect.Value{}, fmt.Errorf("savecore: node missing %q", keyID)
 	}
 	id := *probe.ID
-	if existing, ok := d.table[id]; ok {
+	if existing, ok := d.table[id]; ok && d.filled[id] {
 		return existing, nil
 	}
 	if probe.Type == "" {
@@ -241,8 +333,12 @@ func (d *decoder) decodeRef(raw json.RawMessage) (reflect.Value, error) {
 	if probe.Ver < 1 {
 		return reflect.Value{}, fmt.Errorf("savecore: node %q has invalid version %d", probe.Type, probe.Ver)
 	}
-	inst := reflect.ValueOf(c.New())
-	d.table[id] = inst
+	inst, ok := d.table[id]
+	if !ok {
+		inst = reflect.ValueOf(c.New())
+		d.table[id] = inst
+	}
+	d.filled[id] = true
 
 	var rawData map[string]json.RawMessage
 	wrapper := struct {

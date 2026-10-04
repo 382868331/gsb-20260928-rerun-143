@@ -61,16 +61,24 @@ func (s *Store) Save(root any) (err error) {
 	if err != nil {
 		return err
 	}
+	return WritePayload(s.Path, payload)
+}
+
+// WritePayload packs an already-encoded graph payload into the
+// checksummed frame and publishes it at path atomically, with the
+// same crash guarantees as Save. It exists for tooling (merges,
+// migrations) that builds graph JSON without live objects.
+func WritePayload(path string, payload []byte) (err error) {
 	frame, err := pack(payload)
 	if err != nil {
 		return err
 	}
 
-	dir := filepath.Dir(s.Path)
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("savecore: create save dir: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, filepath.Base(s.Path)+".writing-*")
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".writing-*")
 	if err != nil {
 		return fmt.Errorf("savecore: create temp save: %w", err)
 	}
@@ -95,7 +103,7 @@ func (s *Store) Save(root any) (err error) {
 		return fmt.Errorf("savecore: close temp save: %w", err)
 	}
 	tmp = nil
-	if err = os.Rename(tmpName, s.Path); err != nil {
+	if err = os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("savecore: publish save: %w", err)
 	}
 	if df, derr := os.Open(dir); derr == nil {

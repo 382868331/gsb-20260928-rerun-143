@@ -18,6 +18,7 @@ type Item struct {
 
 // Player is the current (version 2) shape.
 type Player struct {
+	UID       string
 	Name      string
 	Level     int
 	Guild     *Guild
@@ -27,9 +28,28 @@ type Player struct {
 // Guild cycles back to its members; Leader is also in Members,
 // producing a guaranteed cycle and shared node.
 type Guild struct {
+	UID     string
 	Name    string
 	Leader  *Player
 	Members []*Player
+}
+
+// Region groups the objects that are edited together. Objects in
+// one region may freely reference objects in another (a player can
+// carry an item home to another region, or belong to a guild
+// headquartered elsewhere); those cross-region references are what
+// a region-level merge must keep intact.
+type Region struct {
+	Name    string
+	Players []*Player
+	Guilds  []*Guild
+	Items   []*Item
+}
+
+// World is the save root: a fixed list of named regions.
+type World struct {
+	Name    string
+	Regions []*Region
 }
 
 // Registry returns a registry containing every type the current game
@@ -40,6 +60,8 @@ func Registry() *savecore.Registry {
 	reg.Register(savecore.Codec{Name: "world.Item", Version: 1, New: func() any { return &Item{} }})
 	reg.Register(savecore.Codec{Name: "world.Player", Version: 2, New: func() any { return &Player{} }})
 	reg.Register(savecore.Codec{Name: "world.Guild", Version: 2, New: func() any { return &Guild{} }})
+	reg.Register(savecore.Codec{Name: "world.Region", Version: 1, New: func() any { return &Region{} }})
+	reg.Register(savecore.Codec{Name: "world.World", Version: 1, New: func() any { return &World{} }})
 
 	// Player v1: {"Nickname": string, "XP": number, "Guild": node,
 	//             "Inventory": [node]}
