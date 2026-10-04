@@ -375,7 +375,7 @@ func TestKeptReferenceToDeletedObjectIsRescued(t *testing.T) {
 	}
 	var relicRescued bool
 	for _, pr := range report.PendingReferences {
-		if pr.ToType == "world.Item" && pr.Rescued == "base" {
+		if pr.ToType == "world.Item" {
 			relicRescued = true
 		}
 	}
@@ -630,5 +630,304 @@ func TestUndoRegionAdoption(t *testing.T) {
 	merged := loadWorld(t, out)
 	if got := merged.FindRegion("north").Players[0].Level; got != 7 {
 		t.Fatalf("undone adoption leaked into save: level = %d", got)
+	}
+}
+
+// TestUndoRegionKeepsExplicitConflictDecision: UndoRegion retracts
+// only the automatic adoption; an operator's explicit Resolve on an
+// object grouped in that region is the operator's own decision and
+// stays in force (and survives a restart).
+func TestUndoRegionKeepsExplicitConflictDecision(t *testing.T) {
+	dir := t.TempDir()
+	base := saveBase(t, dir)
+	a := editBranch(t, base, filepath.Join(dir, "a.sv"), func(w *world.World) {
+		w.FindRegion("north").Players[0].Level = 99
+	})
+	b := editBranch(t, base, filepath.Join(dir, "b.sv"), func(w *world.World) {
+		w.FindRegion("north").Players[0].Level = 50
+	})
+	out := savecore.NewStore(world.Registry(), filepath.Join(dir, "merged.sv"))
+
+	m := newSession(t, base, a, b, out)
+	adaRow := m.Diff().Objects[0]
+	for _, od := range m.Diff().Objects {
+		if od.Type == "world.Player" && od.Region == "north" {
+			adaRow = od
+		}
+	}
+	if adaRow.Conflict != "modify-modify" {
+		t.Fatalf("expected modify-modify on Ada, got %q", adaRow.Conflict)
+	}
+	if err := m.Resolve(adaRow.StableID, savecore.SideA); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := m.AdoptRegion("north"); err != nil {
+		t.Fatalf("AdoptRegion: %v", err)
+	}
+	if err := m.UndoRegion("north"); err != nil {
+		t.Fatalf("UndoRegion: %v", err)
+	}
+
+	// Reopen like a fresh process; the explicit decision must persist.
+	resumed, err := savecore.ResumeMergeSession(world.Registry(), base, a, b, out)
+	if err != nil {
+		t.Fatalf("ResumeMergeSession: %v", err)
+	}
+	for _, region := range resumed.CleanRegions() {
+		if err := resumed.AdoptRegion(region); err != nil {
+			t.Fatalf("adopt %q: %v", region, err)
+		}
+	}
+	report, err := resumed.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if !report.Complete {
+		t.Fatalf("explicit decision should make north clean: %+v", report)
+	}
+	merged := loadWorld(t, out)
+	if got := merged.FindRegion("north").Players[0].Level; got != 99 {
+		t.Fatalf("operator decision lost across undo/resume: level = %d", got)
+	}
+}
+
+// itemByID finds an item by game ID anywhere in a world.
+func itemByID(w *world.World, id string) *world.Item {
+	for _, r := range w.Regions {
+		for _, it := range r.Items {
+			if it.ID == id {
+				return it
+			}
+		}
+		for _, p := range r.Players {
+			for _, it := range p.Inventory {
+				if it.ID == id {
+					return it
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// TestBranchAddedObjectsGetDistinctIdentities: objects created after
+// the fork inside two sibling branches must not share a stable id,
+// even when (as in this world) both branches mint their first new id
+// at the same counter position. Same-named objects in different
+// regions are two objects, while an object moved between regions and
+// an edit-vs-delete conflict are still tracked by shared identity.
+func TestBranchAddedObjectsGetDistinctIdentities(t *testing.T) {
+	dir := t.TempDir()
+	base := saveBase(t, dir)
+
+	// A: add a brand-new relic to Ada's inventory (north), move the
+	// shared relic into the south region's item list, and level Ada.
+	a := editBranch(t, base, filepath.Join(dir, "a.sv"), func(w *world.World) {
+		north, south := w.FindRegion("north"), w.FindRegion("south")
+		north.Players[0].Inventory = append(north.Players[0].Inventory,
+			&world.Item{ID: "Lantern", Power: 1})
+		relic := north.Items[0]
+		north.Items = north.Items[1:]
+		south.Items = append(south.Items, relic)
+	})
+	// B: independently adds an item with the SAME game id to Bo's
+	// inventory (south), and levels Bo. (Listed under different
+	// regions and minted after the fork, the two must keep distinct
+	// stable identities even though their game ids match.)
+	b := editBranch(t, base, filepath.Join(dir, "b.sv"), func(w *world.World) {
+		south := w.FindRegion("south")
+		south.Players[0].Inventory = append(south.Players[0].Inventory,
+			&world.Item{ID: "Lantern", Power: 9})
+	})
+	out := savecore.NewStore(world.Registry(), filepath.Join(dir, "merged.sv"))
+
+	m := newSession(t, base, a, b, out)
+
+	// The two Lanterns are added on one side each with distinct
+	// stable ids: neither an add-add collision nor a shared object.
+	var lanterns []*savecore.ObjectDiff
+	for _, od := range diffByType(m, "world.Item") {
+		if od.KindA == savecore.Added || od.KindB == savecore.Added {
+			lanterns = append(lanterns, od)
+		}
+	}
+	if len(lanterns) != 2 {
+		t.Fatalf("want two independently added items, got %d: %+v", len(lanterns), lanterns)
+	}
+	if lanterns[0].StableID == lanterns[1].StableID {
+		t.Fatal("branch-added items share a stable id")
+	}
+	for _, od := range lanterns {
+		if od.Conflict == "add-add" || od.Shared {
+			t.Fatalf("distinct new item misclassified: %+v", od)
+		}
+	}
+
+	// The shared relic moved to south: a move, not delete+add.
+	var relicRow *savecore.ObjectDiff
+	for _, od := range diffByType(m, "world.Item") {
+		if od.KindA == savecore.Moved {
+			relicRow = od
+		}
+	}
+	if relicRow == nil {
+		t.Fatal("shared relic move not detected")
+	}
+	if relicRow.RegionA != "south" || relicRow.RegionB != "north" {
+		t.Fatalf("relic move endpoints wrong: %q -> %q", relicRow.RegionB, relicRow.RegionA)
+	}
+
+	adoptAll(t, m)
+	report, err := m.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if !report.Complete {
+		t.Fatalf("merge incomplete: %+v", report)
+	}
+	merged := loadWorld(t, out)
+	north := merged.FindRegion("north")
+	south := merged.FindRegion("south")
+	var northLantern, southLantern *world.Item
+	for _, it := range north.Players[0].Inventory {
+		if it.ID == "Lantern" {
+			northLantern = it
+		}
+	}
+	for _, it := range south.Players[0].Inventory {
+		if it.ID == "Lantern" {
+			southLantern = it
+		}
+	}
+	if northLantern == nil || northLantern.Power != 1 {
+		t.Fatalf("A's new item missing or wrong: %+v", north.Items)
+	}
+	if southLantern == nil || southLantern.Power != 9 {
+		t.Fatalf("B's new item missing or wrong: %+v", south.Items)
+	}
+	if northLantern == southLantern {
+		t.Fatal("the two Lanterns collapsed into one object")
+	}
+	// The shared relic is now stocked in south, still one object.
+	if relic := itemByID(merged, "Aegis-7"); relic == nil {
+		t.Fatal("shared relic lost during merge")
+	}
+	if len(south.Items) != 1 || south.Items[0].ID != "Aegis-7" {
+		t.Fatalf("moved relic not stocked in south: %+v", south.Items)
+	}
+	if len(north.Items) != 0 {
+		t.Fatalf("relic still stocked in north: %+v", north.Items)
+	}
+
+	// Candidates are untouched: the fork sources stay recoverable.
+	if itemByID(loadWorld(t, a), "Lantern") == nil ||
+		itemByID(loadWorld(t, b), "Lantern") == nil {
+		t.Fatal("a candidate's new object was lost or rewritten")
+	}
+}
+
+// TestRescueNewReferenceAcrossResumeAndUndo: an adopted object that
+// references an object from an un-adopted region must not fail just
+// because the referenced object was created after the fork (no base
+// version exists). The target is rescued from the referencing
+// candidate and explicitly reported; resuming after a restart keeps
+// the rescue, and undoing the referencing region retracts it.
+func TestRescueNewReferenceAcrossResumeAndUndo(t *testing.T) {
+	dir := t.TempDir()
+	base := saveBase(t, dir)
+	a := editBranch(t, base, filepath.Join(dir, "a.sv"), func(w *world.World) {
+		north := w.FindRegion("north")
+		sword := &world.Item{ID: "Sword", Power: 5}
+		north.Players[0].Inventory = append(north.Players[0].Inventory, sword)
+	})
+	// B touches an unrelated object in the unregioned root (the
+	// world container) so the "" region is not adoptable while north
+	// is; the sword itself then exists only on A.
+	b := editBranch(t, base, filepath.Join(dir, "b.sv"), func(w *world.World) {
+		w.Regions[0].Name = "north"
+		w.FindRegion("south").Guilds[0].Name = "New Compass"
+	})
+	out := savecore.NewStore(world.Registry(), filepath.Join(dir, "merged.sv"))
+
+	m := newSession(t, base, a, b, out)
+	if err := m.AdoptRegion("north"); err != nil {
+		t.Fatalf("AdoptRegion(north): %v", err)
+	}
+
+	// Restart the process: resume from the persisted state, then finalize.
+	resumed, err := savecore.ResumeMergeSession(world.Registry(), base, a, b, out)
+	if err != nil {
+		t.Fatalf("ResumeMergeSession: %v", err)
+	}
+	report, err := resumed.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize must rescue the new reference, got: %v", err)
+	}
+	merged := loadWorld(t, out)
+	ada := merged.FindRegion("north").Players[0]
+	var sword *world.Item
+	for _, it := range ada.Inventory {
+		if it.ID == "Sword" {
+			sword = it
+		}
+	}
+	if sword == nil {
+		t.Fatalf("new referenced object vanished: %+v", ada.Inventory)
+	}
+	var swordRef *savecore.PendingReference
+	var swordObj *savecore.PendingObject
+	for i := range report.PendingReferences {
+		if report.PendingReferences[i].ToType == "world.Item" {
+			swordRef = &report.PendingReferences[i]
+		}
+	}
+	if swordRef == nil || swordRef.Rescued != "A" {
+		t.Fatalf("rescue must be reported as pulled from A: %+v", report.PendingReferences)
+	}
+	for i := range report.PendingObjects {
+		if report.PendingObjects[i].StableID == swordRef.To {
+			swordObj = &report.PendingObjects[i]
+		}
+	}
+	if swordObj == nil || swordObj.Kept != "A" {
+		t.Fatalf("rescued object must be listed as kept from A: %+v", report.PendingObjects)
+	}
+	if report.Complete {
+		t.Fatal("a merge containing a rescue must not claim completeness")
+	}
+
+	// Undo north: its adoption, the reference decision and the rescued
+	// sword are all retracted; finalizing leaves the base graph intact.
+	if err := resumed.UndoRegion("north"); err != nil {
+		t.Fatalf("UndoRegion: %v", err)
+	}
+	report2, err := resumed.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize after undo: %v", err)
+	}
+	merged2 := loadWorld(t, out)
+	if itemByID(merged2, "Sword") != nil {
+		t.Fatal("rescued object survived undo of the region that referenced it")
+	}
+	ada2 := merged2.FindRegion("north").Players[0]
+	for _, it := range ada2.Inventory {
+		if it.ID == "Sword" {
+			t.Fatal("undone north edit still references the rescued sword")
+		}
+	}
+	var stillRescued bool
+	for _, pr := range report2.PendingReferences {
+		if pr.ToType == "world.Item" {
+			stillRescued = true
+		}
+	}
+	if stillRescued {
+		t.Fatalf("undo did not retract the reference rescue: %+v", report2.PendingReferences)
+	}
+
+	// Original candidates remain exactly as written.
+	wa := loadWorld(t, a)
+	if itemByID(wa, "Sword") == nil {
+		t.Fatal("candidate A was rewritten during merge/undo")
 	}
 }

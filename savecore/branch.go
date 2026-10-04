@@ -77,7 +77,12 @@ func Fork(reg *Registry, store *Store, regionOf RegionOfFunc) (*Branch, error) {
 // CloneBranch starts a new branch of the save at src, stored at dst:
 // the save file and its identity manifest are copied, so the new
 // branch shares the source's stable identities and the source itself
-// stays untouched and recoverable.
+// stays untouched and recoverable. The copied manifest is given a
+// fresh minting nonce: objects inherited from the save point keep
+// their stable ids, while objects each branch creates afterwards get
+// distinct ids even when the siblings were cloned one after another
+// (otherwise the shared nonce plus shared counter would make every
+// independently added object collide with its counterpart).
 func CloneBranch(reg *Registry, src, dst *Store, regionOf RegionOfFunc) (*Branch, error) {
 	frame, err := os.ReadFile(src.Path)
 	if err != nil {
@@ -86,11 +91,13 @@ func CloneBranch(reg *Registry, src, dst *Store, regionOf RegionOfFunc) (*Branch
 	if err := os.WriteFile(dst.Path, frame, 0o644); err != nil {
 		return nil, fmt.Errorf("savecore: clone save: %w", err)
 	}
-	manifest, err := os.ReadFile(ManifestPath(src.Path))
+	manifest, err := LoadManifest(ManifestPath(src.Path))
 	if err != nil {
 		return nil, fmt.Errorf("savecore: source has no identity manifest: %w", err)
 	}
-	if err := os.WriteFile(ManifestPath(dst.Path), manifest, 0o644); err != nil {
+	manifest.Nonce = newNonce()
+	manifest.Seq = 0
+	if err := manifest.save(ManifestPath(dst.Path)); err != nil {
 		return nil, fmt.Errorf("savecore: clone manifest: %w", err)
 	}
 	return Fork(reg, dst, regionOf)

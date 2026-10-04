@@ -77,9 +77,12 @@ type candidate struct {
 	manifest *Manifest
 	states   map[string]*ObjectState
 	rootSID  string
+	side     Side
 }
 
-func loadCandidate(reg *Registry, store *Store) (*candidate, error) {
+func (c *candidate) sideName() string { return string(c.side) }
+
+func loadCandidate(reg *Registry, store *Store, side Side) (*candidate, error) {
 	frame, err := os.ReadFile(store.Path)
 	if err != nil {
 		return nil, fmt.Errorf("savecore: read candidate %s: %w", store.Path, err)
@@ -103,7 +106,7 @@ func loadCandidate(reg *Registry, store *Store) (*candidate, error) {
 			refCount[id]++
 		}
 	}
-	c := &candidate{graph: g, manifest: m, states: map[string]*ObjectState{}}
+	c := &candidate{graph: g, manifest: m, states: map[string]*ObjectState{}, side: side}
 	for id, node := range g.Nodes {
 		sid, ok := m.Nodes[id]
 		if !ok {
@@ -228,15 +231,15 @@ func DiffCandidates(reg *Registry, baseStore, storeA, storeB *Store) (*Diff, err
 }
 
 func loadAll(reg *Registry, baseStore, storeA, storeB *Store) (*candidate, *candidate, *candidate, error) {
-	base, err := loadCandidate(reg, baseStore)
+	base, err := loadCandidate(reg, baseStore, Side("base"))
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	a, err := loadCandidate(reg, storeA)
+	a, err := loadCandidate(reg, storeA, SideA)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	b, err := loadCandidate(reg, storeB)
+	b, err := loadCandidate(reg, storeB, SideB)
 	if err != nil {
 		return nil, nil, nil, err
 	}

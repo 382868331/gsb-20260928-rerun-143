@@ -20,7 +20,7 @@ type PendingObject struct {
 	Type     string `json:"type"`
 	Region   string `json:"region"`
 	Reason   string `json:"reason"` // conflict kind or "not adopted"
-	Kept     string `json:"kept"`   // "base" or "excluded"
+	Kept     string `json:"kept"`   // "base", "A", "B" or "excluded"
 }
 
 // PendingReference records a reference whose target would have
@@ -30,7 +30,7 @@ type PendingReference struct {
 	From    string `json:"from"`
 	To      string `json:"to"`
 	ToType  string `json:"toType"`
-	Rescued string `json:"rescued"` // "base"
+	Rescued string `json:"rescued"` // "base", "A" or "B"
 }
 
 // MergeReport states exactly what a finalized merge did and left out.
@@ -83,13 +83,20 @@ func NewMergeSession(reg *Registry, baseStore, storeA, storeB, out *Store) (*Mer
 // ResumeMergeSession reopens an interrupted merge, restoring every
 // adoption and resolution recorded before the interruption.
 func ResumeMergeSession(reg *Registry, baseStore, storeA, storeB, out *Store) (*MergeSession, error) {
-	m, err := NewMergeSession(reg, baseStore, storeA, storeB, out)
+	base, a, b, err := loadAll(reg, baseStore, storeA, storeB)
 	if err != nil {
 		return nil, err
 	}
+	m := &MergeSession{
+		reg: reg, base: base, a: a, b: b, out: out,
+		adoptedRegions: map[string]bool{},
+		decisions:      map[string]Side{},
+		statePath:      MergeStatePath(out.Path),
+	}
+	m.diff = computeDiff(base, a, b)
 	raw, err := os.ReadFile(m.statePath)
 	if err != nil {
-		return nil, fmt.Errorf("savecore: no interrupted merge to resume: %w", err)
+		return nil, fmt.Errorf("savecore: no interrupted merge to resume at %s: %w", m.statePath, err)
 	}
 	var sf mergeStateFile
 	if err := json.Unmarshal(raw, &sf); err != nil {
@@ -164,17 +171,15 @@ func (m *MergeSession) AdoptRegion(region string) error {
 }
 
 // UndoRegion withdraws one region adoption and every object decision
-// made inside that region. Reference consequences are recomputed at
-// the next Finalize, so undoing an adoption also retracts the
-// reference decisions that depended on it.
+// made *by that adoption*. Explicit conflict Resolve choices are the
+// operator's own decisions and are left intact: undoing a region only
+// retracts the automatic adoption (and the reference rescues that
+// depended on it, which are recomputed at the next Finalize).
 func (m *MergeSession) UndoRegion(region string) error {
 	if !m.adoptedRegions[region] {
 		return fmt.Errorf("savecore: region %q was not adopted", region)
 	}
 	delete(m.adoptedRegions, region)
-	for _, od := range m.diff.Regions[region] {
-		delete(m.decisions, od.StableID)
-	}
 	return m.persist()
 }
 
@@ -290,7 +295,11 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 		od := m.diff.byID[sid]
 		cs, decided := m.resolve(od)
 		if !decided {
-			// Not adopted: keep the base version, say so explicitly.
+			// Not adopted: by default keep the base version and say so
+			// explicitly. If a chosen object later references a new
+			// object that has no base version, the integrity pass below
+			// pulls that candidate's copy in and rewrites the Kept tag
+			// rather than dropping the object or failing the write.
 			report.Complete = false
 			reason := od.Conflict
 			if reason == "" {
@@ -315,8 +324,11 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 	}
 
 	// Reference integrity: every reference of every chosen object must
-	// land on a chosen object. Missing targets are rescued from the
-	// base and reported, never duplicated and never left dangling.
+	// land on a chosen object. A missing target is rescued from the
+	// same candidate that referenced it whenever possible (a genuinely
+	// new object has no base version to fall back to), and otherwise
+	// from the base. Every rescue is reported, never duplicated, never
+	// left dangling, and never silently dropped.
 	for {
 		missing := false
 		for _, sid := range sorted {
@@ -328,13 +340,13 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 				if chosen[target] != nil {
 					continue
 				}
-				bs := m.base.states[target]
-				if bs == nil {
-					return nil, fmt.Errorf("savecore: reference %s -> %s has no base version to rescue", sid, target)
+				rescued := m.rescueState(cs, target)
+				if rescued == nil {
+					return nil, fmt.Errorf("savecore: reference %s -> %s cannot be rescued from any candidate", sid, target)
 				}
-				chosen[target] = &chosenState{state: bs, source: m.base, side: "base"}
+				chosen[target] = rescued
 				report.PendingReferences = append(report.PendingReferences, PendingReference{
-					From: sid, To: target, ToType: bs.Type, Rescued: "base",
+					From: sid, To: target, ToType: rescued.state.Type, Rescued: rescued.side,
 				})
 				report.Complete = false
 				missing = true
@@ -343,6 +355,45 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 		if !missing {
 			break
 		}
+	}
+
+	// Rescued objects are new graph members (pending, pulled in only
+	// because a chosen object references them); list them as pending
+	// objects too, so nothing the official save contains goes unreported.
+	for _, pr := range report.PendingReferences {
+		target := pr.To
+		alreadyPending := false
+		for i := range report.PendingObjects {
+			if report.PendingObjects[i].StableID == target {
+				// The object was already listed as not adopted; its Kept
+				// entry now reflects where the rescue pulled it from.
+				report.PendingObjects[i].Kept = pr.Rescued
+				alreadyPending = true
+				break
+			}
+		}
+		if alreadyPending || pr.Rescued == "base" {
+			continue
+		}
+		od := m.diff.byID[target]
+		region, reason := "", "rescued reference"
+		if od != nil {
+			region = od.Region
+			if od.Conflict != "" {
+				reason = od.Conflict
+			}
+		}
+		rs := chosen[target]
+		ttype, tregion := "", region
+		if rs != nil {
+			ttype = rs.state.Type
+			if region == "" {
+				tregion = rs.state.Region
+			}
+		}
+		report.PendingObjects = append(report.PendingObjects, PendingObject{
+			StableID: target, Type: ttype, Region: tregion, Reason: reason, Kept: pr.Rescued,
+		})
 	}
 
 	// Assemble the merged flat graph with fresh local node ids.
@@ -398,6 +449,29 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 		return nil, err
 	}
 	return report, nil
+}
+
+// rescueState finds a live version of target for a reference made by
+// referrer. The referrer's own candidate wins: newly added objects
+// exist nowhere else, and references written inside one candidate
+// must point at that candidate's view. Base is the fallback for
+// targets both candidates inherited from the save point.
+func (m *MergeSession) rescueState(referrer *chosenState, target string) *chosenState {
+	if referrer.source != nil {
+		if st := referrer.source.states[target]; st != nil {
+			return &chosenState{state: st, source: referrer.source, side: referrer.source.sideName()}
+		}
+	}
+	// A merged (A+B) state came from one side's content; try both.
+	for _, c := range []*candidate{m.a, m.b} {
+		if st := c.states[target]; st != nil {
+			return &chosenState{state: st, source: c, side: c.sideName()}
+		}
+	}
+	if st := m.base.states[target]; st != nil {
+		return &chosenState{state: st, source: m.base, side: "base"}
+	}
+	return nil
 }
 
 // targetsOf lists the stable ids a chosen object references.
