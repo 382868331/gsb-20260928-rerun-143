@@ -53,6 +53,16 @@
   区域，再 Resolve 逐个处理冲突；UndoRegion 只撤回对应区域及其引用
   后果。每次决定立即落盘（<输出>.merge.json），中断后
   ResumeMergeSession 继续；候选文件从不被改写，始终可恢复。
+- 可命名审核检查点：SaveCheckpoint(name) 将已采用区域、人工对象决定、
+  当时仍待处理对象以及引用救回决定保存到
+  <输出>.merge.checkpoints/<name>.json。引用决定记录
+  dependsOnRegion；ResumeMergeSessionFromCheckpoint 可在之后的会话从
+  指定检查点恢复，LoadMergeCheckpoint/CompareMergeCheckpoints 可读取并
+  比较任意两个检查点，差异分别列出新增/移除的区域采用、对象决定、待处理
+  对象和引用决定。恢复检查点只替换合并审核状态，不触碰 base/A/B。
+- 精准撤回：UndoRegionDetailed(region) 撤回指定区域并返回该区域导致失效
+  的引用决定；其他区域的采用记录和无关引用决定继续保留。旧的
+  UndoRegion(region) 仍保持只返回 error 的兼容接口。
 - 正式存档不谎报：Finalize 始终写出可加载的存档，未采用的内容回退
   到 base 版本，并在存档内嵌的 merge 报告中逐一列明
   （pendingObjects / pendingReferences，complete=false）。被删除却仍
@@ -64,4 +74,6 @@
 
 测试（world/merge_test.go）覆盖：无冲突区域先行采用、共享对象与跨区
 引用身份保持、跨区移动识别、删除-修改冲突与未采用清单、被删目标的
-引用救回、不同数据版本候选的比较与原始资料保留、中断重开、撤销采用。
+引用救回、不同数据版本候选的比较与原始资料保留、中断重开、撤销采用，
+以及跨会话命名检查点、检查点差异、候选文件不被改写和按区域失效的
+引用决定。

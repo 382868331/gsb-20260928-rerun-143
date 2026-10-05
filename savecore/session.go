@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 )
 
 // MergeSession is a resumable, region-oriented merge. The operator
@@ -28,10 +31,42 @@ type PendingObject struct {
 // candidate that introduced it when it is branch-new) so the merged
 // save has neither duplicates nor dangling targets.
 type PendingReference struct {
-	From    string `json:"from"`
-	To      string `json:"to"`
-	ToType  string `json:"toType"`
-	Rescued string `json:"rescued"` // "base", "A" or "B"
+	From            string `json:"from"`
+	To              string `json:"to"`
+	ToType          string `json:"toType"`
+	Rescued         string `json:"rescued"` // "base", "A" or "B"
+	DependsOnRegion string `json:"dependsOnRegion,omitempty"`
+}
+
+// ReferenceDecision is the persisted form of a reference rescue used
+// by a review checkpoint. DependsOnRegion identifies the adopted
+// region whose chosen object introduced the requirement; it is empty
+// for a consequence of an unresolved base fallback.
+type ReferenceDecision = PendingReference
+
+// MergeCheckpoint is a named, restorable review snapshot.
+type MergeCheckpoint struct {
+	Name               string              `json:"name"`
+	CreatedAt          time.Time           `json:"createdAt"`
+	AdoptedRegions     []string            `json:"adoptedRegions"`
+	Decisions          map[string]Side     `json:"decisions"`
+	PendingObjects     []PendingObject     `json:"pendingObjects"`
+	ReferenceDecisions []ReferenceDecision `json:"referenceDecisions"`
+}
+
+// CheckpointDiff compares two named review snapshots. Slices use the
+// from-checkpoint as Removed and the to-checkpoint as Added.
+type CheckpointDiff struct {
+	FromName                  string
+	ToName                    string
+	AddedAdoptedRegions       []string
+	RemovedAdoptedRegions     []string
+	AddedDecisions            map[string]Side
+	RemovedDecisions          map[string]Side
+	AddedPendingObjects       []PendingObject
+	RemovedPendingObjects     []PendingObject
+	AddedReferenceDecisions   []ReferenceDecision
+	RemovedReferenceDecisions []ReferenceDecision
 }
 
 // MergeReport states exactly what a finalized merge did and left out.
@@ -45,23 +80,30 @@ type MergeReport struct {
 // MergeSession holds the merge state for one (base, A, B) -> out
 // combination.
 type MergeSession struct {
-	reg            *Registry
-	base, a, b     *candidate
-	out            *Store
-	diff           *Diff
-	adoptedRegions map[string]bool
-	decisions      map[string]Side
-	statePath      string
+	reg                *Registry
+	base, a, b         *candidate
+	out                *Store
+	diff               *Diff
+	adoptedRegions     map[string]bool
+	decisions          map[string]Side
+	referenceDecisions []ReferenceDecision
+	statePath          string
 }
 
 type mergeStateFile struct {
-	AdoptedRegions []string        `json:"adoptedRegions"`
-	Decisions      map[string]Side `json:"decisions"`
+	AdoptedRegions     []string            `json:"adoptedRegions"`
+	Decisions          map[string]Side     `json:"decisions"`
+	ReferenceDecisions []ReferenceDecision `json:"referenceDecisions,omitempty"`
 }
 
 // MergeStatePath is where the resumable merge state for an output
 // save is kept.
 func MergeStatePath(outPath string) string { return outPath + ".merge.json" }
+
+// MergeCheckpointPath is where one named review checkpoint is kept.
+func MergeCheckpointPath(outPath, name string) string {
+	return filepath.Join(outPath+".merge.checkpoints", name+".json")
+}
 
 // NewMergeSession starts a fresh merge of A and B (both forked from
 // base) into out. If a previous merge state exists for out it is
@@ -102,6 +144,7 @@ func ResumeMergeSession(reg *Registry, baseStore, storeA, storeB, out *Store) (*
 	for sid, side := range sf.Decisions {
 		m.decisions[sid] = side
 	}
+	m.referenceDecisions = append(m.referenceDecisions, sf.ReferenceDecisions...)
 	return m, nil
 }
 
@@ -111,11 +154,215 @@ func (m *MergeSession) persist() error {
 		sf.AdoptedRegions = append(sf.AdoptedRegions, r)
 	}
 	sort.Strings(sf.AdoptedRegions)
+	sf.ReferenceDecisions = append(sf.ReferenceDecisions, m.referenceDecisions...)
 	raw, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(m.statePath, raw, 0o644)
+}
+
+func (m *MergeSession) refreshPlan() error {
+	plan, err := m.buildPlan()
+	if err != nil {
+		return err
+	}
+	m.referenceDecisions = plan.report.PendingReferences
+	return nil
+}
+
+// SaveCheckpoint stores a named review snapshot without modifying the
+// base or either candidate.
+func (m *MergeSession) SaveCheckpoint(name string) (*MergeCheckpoint, error) {
+	if err := validateCheckpointName(name); err != nil {
+		return nil, err
+	}
+	plan, err := m.buildPlan()
+	if err != nil {
+		return nil, err
+	}
+	m.referenceDecisions = append([]ReferenceDecision(nil), plan.report.PendingReferences...)
+	cp := &MergeCheckpoint{
+		Name:               name,
+		CreatedAt:          time.Now().UTC(),
+		Decisions:          map[string]Side{},
+		ReferenceDecisions: append([]ReferenceDecision(nil), m.referenceDecisions...),
+	}
+	for region := range m.adoptedRegions {
+		cp.AdoptedRegions = append(cp.AdoptedRegions, region)
+	}
+	sort.Strings(cp.AdoptedRegions)
+	for sid, side := range m.decisions {
+		cp.Decisions[sid] = side
+	}
+	cp.PendingObjects = append([]PendingObject(nil), plan.report.PendingObjects...)
+	raw, err := json.MarshalIndent(cp, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	path := MergeCheckpointPath(m.out.Path, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("savecore: create checkpoint dir: %w", err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		return nil, fmt.Errorf("savecore: write checkpoint: %w", err)
+	}
+	if err := m.persist(); err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
+// RestoreCheckpoint replaces the active session state with a named
+// checkpoint. Only merge metadata and later output saves are changed;
+// the original candidate files are never rewritten.
+func (m *MergeSession) RestoreCheckpoint(name string) (*MergeCheckpoint, error) {
+	cp, err := LoadMergeCheckpoint(m.out.Path, name)
+	if err != nil {
+		return nil, err
+	}
+	m.adoptedRegions = map[string]bool{}
+	m.decisions = map[string]Side{}
+	for _, region := range cp.AdoptedRegions {
+		m.adoptedRegions[region] = true
+	}
+	for sid, side := range cp.Decisions {
+		m.decisions[sid] = side
+	}
+	m.referenceDecisions = append([]ReferenceDecision(nil), cp.ReferenceDecisions...)
+	return cp, m.persist()
+}
+
+// ResumeMergeSessionFromCheckpoint resumes from a named checkpoint.
+func ResumeMergeSessionFromCheckpoint(reg *Registry, baseStore, storeA, storeB, out *Store, checkpoint string) (*MergeSession, error) {
+	m, err := NewMergeSession(reg, baseStore, storeA, storeB, out)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := m.RestoreCheckpoint(checkpoint); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// LoadMergeCheckpoint reads one named checkpoint.
+func LoadMergeCheckpoint(outPath, name string) (*MergeCheckpoint, error) {
+	if err := validateCheckpointName(name); err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(MergeCheckpointPath(outPath, name))
+	if err != nil {
+		return nil, fmt.Errorf("savecore: no merge checkpoint %q: %w", name, err)
+	}
+	var cp MergeCheckpoint
+	if err := json.Unmarshal(raw, &cp); err != nil {
+		return nil, fmt.Errorf("savecore: malformed merge checkpoint %q: %w", name, err)
+	}
+	if cp.Decisions == nil {
+		cp.Decisions = map[string]Side{}
+	}
+	return &cp, nil
+}
+
+// CompareMergeCheckpoints compares two checkpoints stored for outPath.
+func CompareMergeCheckpoints(outPath, fromName, toName string) (*CheckpointDiff, error) {
+	from, err := LoadMergeCheckpoint(outPath, fromName)
+	if err != nil {
+		return nil, err
+	}
+	to, err := LoadMergeCheckpoint(outPath, toName)
+	if err != nil {
+		return nil, err
+	}
+	return CompareCheckpointData(from, to), nil
+}
+
+// CompareCheckpointData compares checkpoint values in memory.
+func CompareCheckpointData(from, to *MergeCheckpoint) *CheckpointDiff {
+	d := &CheckpointDiff{FromName: from.Name, ToName: to.Name, AddedDecisions: map[string]Side{}, RemovedDecisions: map[string]Side{}}
+	fromRegions := stringSet(from.AdoptedRegions)
+	toRegions := stringSet(to.AdoptedRegions)
+	d.RemovedAdoptedRegions = removedSortedStrings(fromRegions, toRegions)
+	d.AddedAdoptedRegions = removedSortedStrings(toRegions, fromRegions)
+	for sid, side := range from.Decisions {
+		if to.Decisions[sid] != side {
+			d.RemovedDecisions[sid] = side
+		}
+	}
+	for sid, side := range to.Decisions {
+		if from.Decisions[sid] != side {
+			d.AddedDecisions[sid] = side
+		}
+	}
+	d.RemovedPendingObjects = removedPending(from.PendingObjects, to.PendingObjects)
+	d.AddedPendingObjects = removedPending(to.PendingObjects, from.PendingObjects)
+	d.RemovedReferenceDecisions = removedRefs(from.ReferenceDecisions, to.ReferenceDecisions)
+	d.AddedReferenceDecisions = removedRefs(to.ReferenceDecisions, from.ReferenceDecisions)
+	return d
+}
+
+func validateCheckpointName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`+"\x00") {
+		return fmt.Errorf("savecore: invalid checkpoint name %q", name)
+	}
+	return nil
+}
+
+func stringSet(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		out[value] = true
+	}
+	return out
+}
+
+func removedSortedStrings(a, b map[string]bool) []string {
+	var out []string
+	for value := range a {
+		if !b[value] {
+			out = append(out, value)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func pendingKey(po PendingObject) string {
+	return strings.Join([]string{po.StableID, po.Type, po.Region, po.Reason, po.Kept}, "\x00")
+}
+
+func removedPending(a, b []PendingObject) []PendingObject {
+	seen := map[string]bool{}
+	for _, po := range b {
+		seen[pendingKey(po)] = true
+	}
+	var out []PendingObject
+	for _, po := range a {
+		if !seen[pendingKey(po)] {
+			out = append(out, po)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return pendingKey(out[i]) < pendingKey(out[j]) })
+	return out
+}
+
+func referenceKey(rd ReferenceDecision) string {
+	return strings.Join([]string{rd.From, rd.To, rd.ToType, rd.Rescued, rd.DependsOnRegion}, "\x00")
+}
+
+func removedRefs(a, b []ReferenceDecision) []ReferenceDecision {
+	seen := map[string]bool{}
+	for _, rd := range b {
+		seen[referenceKey(rd)] = true
+	}
+	var out []ReferenceDecision
+	for _, rd := range a {
+		if !seen[referenceKey(rd)] {
+			out = append(out, rd)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return referenceKey(out[i]) < referenceKey(out[j]) })
+	return out
 }
 
 // Diff returns the full comparison the session is working from.
@@ -161,6 +408,10 @@ func (m *MergeSession) AdoptRegion(region string) error {
 		}
 	}
 	m.adoptedRegions[region] = true
+	if err := m.refreshPlan(); err != nil {
+		delete(m.adoptedRegions, region)
+		return err
+	}
 	return m.persist()
 }
 
@@ -169,14 +420,46 @@ func (m *MergeSession) AdoptRegion(region string) error {
 // the next Finalize, so undoing an adoption also retracts the
 // reference decisions that depended on it.
 func (m *MergeSession) UndoRegion(region string) error {
+	_, err := m.UndoRegionDetailed(region)
+	return err
+}
+
+// UndoneRegion describes the effects of withdrawing one region.
+type UndoneRegion struct {
+	Region                        string
+	RetractedObjectDecisions      []string
+	InvalidatedReferenceDecisions []ReferenceDecision
+}
+
+// UndoRegionDetailed withdraws one region and reports the reference
+// decisions that become invalid because that adopted region caused
+// them. Adoptions and decisions in other regions remain intact.
+func (m *MergeSession) UndoRegionDetailed(region string) (*UndoneRegion, error) {
 	if !m.adoptedRegions[region] {
-		return fmt.Errorf("savecore: region %q was not adopted", region)
+		return nil, fmt.Errorf("savecore: region %q was not adopted", region)
 	}
+	oldReferenceDecisions := append([]ReferenceDecision(nil), m.referenceDecisions...)
 	delete(m.adoptedRegions, region)
+	var retracted []string
 	for _, od := range m.diff.Regions[region] {
+		if _, ok := m.decisions[od.StableID]; ok {
+			retracted = append(retracted, od.StableID)
+		}
 		delete(m.decisions, od.StableID)
 	}
-	return m.persist()
+	sort.Strings(retracted)
+	if err := m.refreshPlan(); err != nil {
+		return nil, err
+	}
+	invalidated := removedRefs(oldReferenceDecisions, m.referenceDecisions)
+	if err := m.persist(); err != nil {
+		return nil, err
+	}
+	return &UndoneRegion{
+		Region:                        region,
+		RetractedObjectDecisions:      retracted,
+		InvalidatedReferenceDecisions: invalidated,
+	}, nil
 }
 
 // Resolve records the operator's choice for one conflicting object.
@@ -189,6 +472,10 @@ func (m *MergeSession) Resolve(stableID string, side Side) error {
 		return fmt.Errorf("savecore: side must be %q or %q", SideA, SideB)
 	}
 	m.decisions[stableID] = side
+	if err := m.refreshPlan(); err != nil {
+		delete(m.decisions, stableID)
+		return err
+	}
 	return m.persist()
 }
 
@@ -213,6 +500,13 @@ type chosenState struct {
 	state  *ObjectState // nil: object is deleted in the merged save
 	source *candidate   // candidate the state (and its refs) came from
 	side   string       // "A", "B", "base"
+	region string       // review region responsible for this state
+}
+
+type mergePlan struct {
+	chosen map[string]*chosenState
+	sorted []string
+	report *MergeReport
 }
 
 // resolve picks the winning state for one object.
@@ -263,14 +557,9 @@ func (m *MergeSession) autoResolve(od *ObjectDiff) chosenState {
 	}
 }
 
-// Finalize assembles the merged save and writes it to the output
-// store. Undecided objects fall back to their base version (or stay
-// excluded if they are new), and the report names every one of them:
-// the official save never claims a complete merge it did not do.
-func (m *MergeSession) Finalize() (*MergeReport, error) {
+func (m *MergeSession) buildPlan() (*mergePlan, error) {
 	report := &MergeReport{Complete: true}
 	chosen := map[string]*chosenState{}
-
 	sids := map[string]bool{}
 	for sid := range m.base.states {
 		sids[sid] = true
@@ -291,7 +580,6 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 		od := m.diff.byID[sid]
 		cs, decided := m.resolve(od)
 		if !decided {
-			// Not adopted: keep the base version, say so explicitly.
 			report.Complete = false
 			reason := od.Conflict
 			if reason == "" {
@@ -309,15 +597,13 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 			}
 			continue
 		}
+		cs.region = od.Region
 		if cs.state != nil {
 			c := cs
 			chosen[sid] = &c
 		}
 	}
 
-	// Reference integrity: every reference of every chosen object must
-	// land on a chosen object. Missing targets are rescued from the
-	// base and reported, never duplicated and never left dangling.
 	for {
 		missing := false
 		for _, sid := range sorted {
@@ -331,13 +617,8 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 				}
 				bs := m.base.states[target]
 				rescued := "base"
-				var rescueSrc *candidate = m.base
+				rescueSrc := m.base
 				if bs == nil {
-					// Branch-new target with no base version to fall back
-					// to: rescue the version from the candidate whose
-					// chosen reference points at it, instead of silently
-					// dropping the object. Prefer the reference's own side
-					// so the graph stays internally consistent.
 					var src *candidate
 					switch cs.side {
 					case "A":
@@ -370,9 +651,9 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 					}
 					rescueSrc = src
 				}
-				chosen[target] = &chosenState{state: bs, source: rescueSrc, side: rescued}
+				chosen[target] = &chosenState{state: bs, source: rescueSrc, side: rescued, region: cs.region}
 				report.PendingReferences = append(report.PendingReferences, PendingReference{
-					From: sid, To: target, ToType: bs.Type, Rescued: rescued,
+					From: sid, To: target, ToType: bs.Type, Rescued: rescued, DependsOnRegion: cs.region,
 				})
 				report.Complete = false
 				missing = true
@@ -382,6 +663,48 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 			break
 		}
 	}
+
+	for region := range m.adoptedRegions {
+		report.AdoptedRegions = append(report.AdoptedRegions, region)
+	}
+	sort.Strings(report.AdoptedRegions)
+	if len(report.PendingReferences) > 0 {
+		rescued := map[string]bool{}
+		for _, pr := range report.PendingReferences {
+			rescued[pr.To] = true
+		}
+		kept := report.PendingObjects[:0]
+		for _, po := range report.PendingObjects {
+			if po.Kept == "excluded" && rescued[po.StableID] {
+				continue
+			}
+			kept = append(kept, po)
+		}
+		report.PendingObjects = kept
+	}
+	sort.Slice(report.PendingObjects, func(i, j int) bool {
+		return report.PendingObjects[i].StableID < report.PendingObjects[j].StableID
+	})
+	sort.Slice(report.PendingReferences, func(i, j int) bool {
+		left, right := report.PendingReferences[i], report.PendingReferences[j]
+		if left.To != right.To {
+			return left.To < right.To
+		}
+		return left.From < right.From
+	})
+	return &mergePlan{chosen: chosen, sorted: sorted, report: report}, nil
+}
+
+// Finalize assembles the merged save and writes it to the output store.
+func (m *MergeSession) Finalize() (*MergeReport, error) {
+	plan, err := m.buildPlan()
+	if err != nil {
+		return nil, err
+	}
+	report := plan.report
+	chosen := plan.chosen
+	sorted := plan.sorted
+	m.referenceDecisions = append([]ReferenceDecision(nil), report.PendingReferences...)
 
 	// Assemble the merged flat graph with fresh local node ids.
 	newID := map[string]int{}
@@ -410,33 +733,6 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 	}
 	merged.Root = rootID
 
-	for r := range m.adoptedRegions {
-		report.AdoptedRegions = append(report.AdoptedRegions, r)
-	}
-	sort.Strings(report.AdoptedRegions)
-	// A branch-new object first listed as an unadopted exclusion may
-	// have been pulled back in by the reference-rescue pass; keep one
-	// consistent story instead of reporting it both excluded and kept.
-	if len(report.PendingReferences) > 0 {
-		rescued := map[string]bool{}
-		for _, pr := range report.PendingReferences {
-			rescued[pr.To] = true
-		}
-		kept := report.PendingObjects[:0]
-		for _, po := range report.PendingObjects {
-			if po.Kept == "excluded" && rescued[po.StableID] {
-				continue
-			}
-			kept = append(kept, po)
-		}
-		report.PendingObjects = kept
-	}
-	sort.Slice(report.PendingObjects, func(i, j int) bool {
-		return report.PendingObjects[i].StableID < report.PendingObjects[j].StableID
-	})
-	sort.Slice(report.PendingReferences, func(i, j int) bool {
-		return report.PendingReferences[i].To < report.PendingReferences[j].To
-	})
 	merged.Extra["merge"] = report
 
 	payload, err := merged.Unflatten()

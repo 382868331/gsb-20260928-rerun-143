@@ -1,6 +1,7 @@
 package world_test
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -952,3 +953,195 @@ func TestBranchNewObjectsGetDistinctIdentities(t *testing.T) {
 }
 
 func containsSID(m map[string]int, sid string) bool { _, ok := m[sid]; return ok }
+
+func TestMergeCheckpointsResumeCompareAndUndoReferences(t *testing.T) {
+	dir := t.TempDir()
+	base := saveBase(t, dir)
+	a := editBranch(t, base, filepath.Join(dir, "a.sv"), func(w *world.World) {
+		w.FindRegion("north").Players[0].Level = 99
+	})
+	b := editBranch(t, base, filepath.Join(dir, "b.sv"), func(w *world.World) {
+		echo := &world.Item{ID: "Echo", Power: 3}
+		w.FindRegion("south").Players[0].Inventory = append(
+			w.FindRegion("south").Players[0].Inventory, echo,
+		)
+	})
+	outPath := filepath.Join(dir, "merged.sv")
+	out := savecore.NewStore(world.Registry(), outPath)
+
+	hashes := map[string][32]byte{}
+	for label, store := range map[string]*savecore.Store{"base": base, "A": a, "B": b} {
+		raw, err := os.ReadFile(store.Path)
+		if err != nil {
+			t.Fatalf("read %s: %v", label, err)
+		}
+		hashes[label] = sha256.Sum256(raw)
+	}
+
+	m := newSession(t, base, a, b, out)
+	var echo *savecore.ObjectDiff
+	for _, od := range diffByType(m, "world.Item") {
+		if od.KindB == savecore.Added {
+			echo = od
+		}
+	}
+	if echo == nil {
+		t.Fatal("branch-new Echo missing from diff")
+	}
+	if err := m.AdoptRegion("north"); err != nil {
+		t.Fatalf("AdoptRegion(north): %v", err)
+	}
+	cp1, err := m.SaveCheckpoint("north-only")
+	if err != nil {
+		t.Fatalf("SaveCheckpoint north-only: %v", err)
+	}
+	if len(cp1.PendingObjects) == 0 {
+		t.Fatal("first checkpoint must preserve pending Echo")
+	}
+
+	resumed, err := savecore.ResumeMergeSessionFromCheckpoint(world.Registry(), base, a, b, out, "north-only")
+	if err != nil {
+		t.Fatalf("ResumeMergeSessionFromCheckpoint: %v", err)
+	}
+	if err := resumed.AdoptRegion("south"); err != nil {
+		t.Fatalf("AdoptRegion(south): %v", err)
+	}
+	cp2, err := resumed.SaveCheckpoint("both-regions")
+	if err != nil {
+		t.Fatalf("SaveCheckpoint both-regions: %v", err)
+	}
+	var echoReference savecore.ReferenceDecision
+	for _, rd := range cp2.ReferenceDecisions {
+		if rd.To == echo.StableID {
+			echoReference = rd
+		}
+	}
+	if echoReference.To == "" || echoReference.DependsOnRegion != "south" {
+		t.Fatalf("checkpoint did not save Echo reference decision: %+v", cp2.ReferenceDecisions)
+	}
+
+	delta, err := savecore.CompareMergeCheckpoints(outPath, "north-only", "both-regions")
+	if err != nil {
+		t.Fatalf("CompareMergeCheckpoints: %v", err)
+	}
+	if len(delta.AddedAdoptedRegions) != 1 || delta.AddedAdoptedRegions[0] != "south" {
+		t.Fatalf("added regions = %v, want [south]", delta.AddedAdoptedRegions)
+	}
+	if len(delta.RemovedAdoptedRegions) != 0 {
+		t.Fatalf("unexpected removed regions: %v", delta.RemovedAdoptedRegions)
+	}
+	var removedEchoPending bool
+	for _, po := range delta.RemovedPendingObjects {
+		if po.StableID == echo.StableID {
+			removedEchoPending = true
+		}
+	}
+	if !removedEchoPending {
+		t.Fatalf("Echo pending decision missing from checkpoint diff: %+v", delta.RemovedPendingObjects)
+	}
+	var addedEchoReference bool
+	for _, rd := range delta.AddedReferenceDecisions {
+		if rd.To == echo.StableID && rd.DependsOnRegion == "south" {
+			addedEchoReference = true
+		}
+	}
+	if !addedEchoReference {
+		t.Fatalf("Echo reference missing from checkpoint diff: %+v", delta.AddedReferenceDecisions)
+	}
+
+	reopened, err := savecore.ResumeMergeSessionFromCheckpoint(world.Registry(), base, a, b, out, "north-only")
+	if err != nil {
+		t.Fatalf("restore north-only in later session: %v", err)
+	}
+	if len(reopened.CleanRegions()) == 0 {
+		// Keep the compiler honest that reopened uses the recomputed diff.
+		t.Fatal("restored session lost its merge diff")
+	}
+	if _, err := reopened.SaveCheckpoint("bad/name"); err == nil {
+		t.Fatal("checkpoint names must not contain path separators")
+	}
+
+	finalSession, err := savecore.ResumeMergeSessionFromCheckpoint(world.Registry(), base, a, b, out, "both-regions")
+	if err != nil {
+		t.Fatalf("restore both-regions in later session: %v", err)
+	}
+	undone, err := finalSession.UndoRegionDetailed("south")
+	if err != nil {
+		t.Fatalf("UndoRegionDetailed: %v", err)
+	}
+	var invalidatedEcho bool
+	for _, rd := range undone.InvalidatedReferenceDecisions {
+		if rd.To == echo.StableID && rd.DependsOnRegion == "south" {
+			invalidatedEcho = true
+		}
+	}
+	if !invalidatedEcho {
+		t.Fatalf("Echo reference not identified as invalid: %+v", undone.InvalidatedReferenceDecisions)
+	}
+	if _, err := finalSession.SaveCheckpoint("after-undo"); err != nil {
+		t.Fatalf("SaveCheckpoint after-undo: %v", err)
+	}
+	undoDelta, err := savecore.CompareMergeCheckpoints(outPath, "both-regions", "after-undo")
+	if err != nil {
+		t.Fatalf("Compare undo checkpoints: %v", err)
+	}
+	if len(undoDelta.RemovedAdoptedRegions) != 1 || undoDelta.RemovedAdoptedRegions[0] != "south" {
+		t.Fatalf("undo checkpoint regions = %+v, want south removed", undoDelta.RemovedAdoptedRegions)
+	}
+	var removedReference bool
+	for _, rd := range undoDelta.RemovedReferenceDecisions {
+		if rd.To == echo.StableID && rd.DependsOnRegion == "south" {
+			removedReference = true
+		}
+	}
+	if !removedReference {
+		t.Fatalf("checkpoint diff did not show invalidated Echo reference: %+v", undoDelta.RemovedReferenceDecisions)
+	}
+	if len(undoDelta.AddedAdoptedRegions) != 0 || !stringInSlice("north", finalSnapshotRegions(t, outPath)) {
+		t.Fatal("undoing south must retain north adoption")
+	}
+	report, err := finalSession.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize after undo: %v", err)
+	}
+	if report.Complete {
+		t.Fatal("undo south must leave south pending")
+	}
+	merged := loadWorld(t, out)
+	if got := merged.FindRegion("north").Players[0].Level; got != 99 {
+		t.Fatalf("north adoption lost after undoing south: level = %d", got)
+	}
+	for _, item := range merged.FindRegion("south").Players[0].Inventory {
+		if item.ID == "Echo" {
+			t.Fatal("invalidated Echo reference survived finalization")
+		}
+	}
+
+	for label, store := range map[string]*savecore.Store{"base": base, "A": a, "B": b} {
+		raw, err := os.ReadFile(store.Path)
+		if err != nil {
+			t.Fatalf("reread %s: %v", label, err)
+		}
+		if sha256.Sum256(raw) != hashes[label] {
+			t.Fatalf("candidate %s was rewritten by checkpoint restore", label)
+		}
+	}
+}
+
+func stringInSlice(want string, values []string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func finalSnapshotRegions(t *testing.T, outPath string) []string {
+	t.Helper()
+	cp, err := savecore.LoadMergeCheckpoint(outPath, "after-undo")
+	if err != nil {
+		t.Fatalf("Load after-undo: %v", err)
+	}
+	return cp.AdoptedRegions
+}
