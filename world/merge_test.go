@@ -604,7 +604,7 @@ func TestUndoRegionAdoption(t *testing.T) {
 	if err := m.AdoptRegion("north"); err != nil {
 		t.Fatalf("AdoptRegion: %v", err)
 	}
-	if err := m.UndoRegion("north"); err != nil {
+	if _, err := m.UndoRegion("north"); err != nil {
 		t.Fatalf("UndoRegion: %v", err)
 	}
 	pending := m.Pending()
@@ -892,7 +892,7 @@ func TestBranchNewObjectsGetDistinctIdentities(t *testing.T) {
 
 	// Undo south: only south adoption and its reference consequences
 	// retract; the north content stays adopted.
-	if err := resumed.UndoRegion("south"); err != nil {
+	if _, err := resumed.UndoRegion("south"); err != nil {
 		t.Fatalf("UndoRegion(south): %v", err)
 	}
 	report, err = resumed.Finalize()
@@ -952,3 +952,191 @@ func TestBranchNewObjectsGetDistinctIdentities(t *testing.T) {
 }
 
 func containsSID(m map[string]int, sid string) bool { _, ok := m[sid]; return ok }
+
+// TestMergeCheckpoints: named checkpoints snapshot adopted regions,
+// pending objects and reference decisions; a later session can diff
+// two checkpoints; restoring a checkpoint never rewrites the
+// candidates; undoing a region between checkpoints names the
+// reference decisions it invalidates while other regions stay adopted.
+func TestMergeCheckpoints(t *testing.T) {
+	dir := t.TempDir()
+	base := saveBase(t, dir)
+	// Branch A drops Bo (south) entirely; branch B only renames the
+	// northern guild, whose base/B member list still references Bo —
+	// so adopting south and taking B's guild produces a reference
+	// rescue decision for Bo.
+	a := editBranch(t, base, filepath.Join(dir, "a.sv"), func(w *world.World) {
+		south := w.FindRegion("south")
+		south.Players = nil
+		south.Guilds = nil
+		carto := w.FindRegion("north").Guilds[0]
+		carto.Members = carto.Members[:1]
+	})
+	b := editBranch(t, base, filepath.Join(dir, "b.sv"), func(w *world.World) {
+		w.FindRegion("north").Guilds[0].Name = "Cartographers II"
+	})
+	out := savecore.NewStore(world.Registry(), filepath.Join(dir, "merged.sv"))
+
+	candidateBytes := func() map[string][]byte {
+		raw := map[string][]byte{}
+		for _, s := range []*savecore.Store{base, a, b} {
+			data, err := os.ReadFile(s.Path)
+			if err != nil {
+				t.Fatalf("read candidate %s: %v", s.Path, err)
+			}
+			raw[s.Path] = data
+		}
+		return raw
+	}
+	before := candidateBytes()
+
+	m := newSession(t, base, a, b, out)
+	var boRow *savecore.ObjectDiff
+	for _, od := range m.Diff().Objects {
+		if od.Type == "world.Player" && od.KindA == savecore.Deleted {
+			boRow = od
+		}
+	}
+	if boRow == nil || boRow.Region != "south" {
+		t.Fatalf("expected Bo as a south deletion row: %+v", boRow)
+	}
+
+	// South is clean and adopts first; the guild is a modify-modify
+	// conflict resolved in B's favour, so the chosen guild still
+	// references the deleted Bo.
+	if err := m.AdoptRegion("south"); err != nil {
+		t.Fatalf("AdoptRegion(south): %v", err)
+	}
+	var cartoRow *savecore.ObjectDiff
+	for _, od := range m.Diff().Objects {
+		if od.Type == "world.Guild" && od.Conflict == "modify-modify" {
+			cartoRow = od
+		}
+	}
+	if cartoRow == nil {
+		t.Fatal("expected a modify-modify conflict on the northern guild")
+	}
+	if err := m.Resolve(cartoRow.StableID, savecore.SideB); err != nil {
+		t.Fatalf("Resolve guild: %v", err)
+	}
+	if err := m.AdoptRegion("north"); err != nil {
+		t.Fatalf("AdoptRegion(north): %v", err)
+	}
+	cp1, err := m.SaveCheckpoint("both-adopted")
+	if err != nil {
+		t.Fatalf("SaveCheckpoint: %v", err)
+	}
+	if len(cp1.AdoptedRegions) != 2 {
+		t.Fatalf("checkpoint regions = %v, want north+south", cp1.AdoptedRegions)
+	}
+	var boRescued bool
+	for _, pr := range cp1.ReferenceDecisions {
+		if pr.To == boRow.StableID && pr.Rescued == "base" {
+			boRescued = true
+		}
+	}
+	if !boRescued {
+		t.Fatalf("checkpoint must record the Bo rescue decision: %+v", cp1.ReferenceDecisions)
+	}
+
+	// Withdraw south: the Bo rescue decision lapses, north stays adopted.
+	invalidated, err := m.UndoRegion("south")
+	if err != nil {
+		t.Fatalf("UndoRegion(south): %v", err)
+	}
+	var boInvalidated bool
+	for _, pr := range invalidated {
+		if pr.To == boRow.StableID {
+			boInvalidated = true
+		}
+	}
+	if !boInvalidated || len(invalidated) == 0 {
+		t.Fatalf("undo must invalidate the Bo rescue: %+v", invalidated)
+	}
+	cp2, err := m.SaveCheckpoint("south-withdrawn")
+	if err != nil {
+		t.Fatalf("SaveCheckpoint 2: %v", err)
+	}
+	if len(cp2.AdoptedRegions) != 1 || cp2.AdoptedRegions[0] != "north" {
+		t.Fatalf("other regions must stay adopted: %v", cp2.AdoptedRegions)
+	}
+	var boPending bool
+	for _, po := range cp2.PendingObjects {
+		if po.StableID == boRow.StableID {
+			boPending = true
+		}
+	}
+	if !boPending {
+		t.Fatalf("withdrawn Bo must be pending in checkpoint: %+v", cp2.PendingObjects)
+	}
+
+	// A later session diffs the two checkpoints from disk.
+	resumed, err := savecore.ResumeMergeSession(world.Registry(), base, a, b, out)
+	if err != nil {
+		t.Fatalf("ResumeMergeSession: %v", err)
+	}
+	names, err := resumed.Checkpoints()
+	if err != nil {
+		t.Fatalf("Checkpoints: %v", err)
+	}
+	if len(names) != 2 || names[0] != "both-adopted" || names[1] != "south-withdrawn" {
+		t.Fatalf("checkpoint names = %v", names)
+	}
+	diff, err := resumed.DiffCheckpoints("both-adopted", "south-withdrawn")
+	if err != nil {
+		t.Fatalf("DiffCheckpoints: %v", err)
+	}
+	if len(diff.RegionsOnlyInA) != 1 || diff.RegionsOnlyInA[0] != "south" {
+		t.Fatalf("diff regions = %+v", diff.RegionsOnlyInA)
+	}
+	var diffShowsBoRescue bool
+	for _, pr := range diff.ReferencesOnlyInA {
+		if pr.To == boRow.StableID {
+			diffShowsBoRescue = true
+		}
+	}
+	if !diffShowsBoRescue {
+		t.Fatalf("diff must show the lapsed Bo rescue: %+v", diff.ReferencesOnlyInA)
+	}
+	var diffShowsBoPending bool
+	for _, po := range diff.PendingOnlyInB {
+		if po.StableID == boRow.StableID {
+			diffShowsBoPending = true
+		}
+	}
+	if !diffShowsBoPending {
+		t.Fatalf("diff must show Bo newly pending: %+v", diff.PendingOnlyInB)
+	}
+
+	// Restore the first checkpoint in the later session: the review
+	// state rolls back, and the candidate files are byte-identical.
+	if err := resumed.RestoreCheckpoint("both-adopted"); err != nil {
+		t.Fatalf("RestoreCheckpoint: %v", err)
+	}
+	report, err := resumed.Finalize()
+	if err != nil {
+		t.Fatalf("Finalize after restore: %v", err)
+	}
+	var boRescuedAfterRestore bool
+	for _, pr := range report.PendingReferences {
+		if pr.To == boRow.StableID {
+			boRescuedAfterRestore = true
+		}
+	}
+	if !boRescuedAfterRestore {
+		t.Fatalf("restored checkpoint lost the Bo rescue: %+v", report.PendingReferences)
+	}
+	merged := loadWorld(t, out)
+	if len(merged.FindRegion("south").Players) != 0 {
+		t.Fatal("restored adoption did not re-apply the south deletion")
+	}
+	for path, data := range before {
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read candidate %s: %v", path, err)
+		}
+		if string(after) != string(data) {
+			t.Fatalf("candidate %s was rewritten by checkpoint restore", path)
+		}
+	}
+}

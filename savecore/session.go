@@ -165,18 +165,51 @@ func (m *MergeSession) AdoptRegion(region string) error {
 }
 
 // UndoRegion withdraws one region adoption and every object decision
-// made inside that region. Reference consequences are recomputed at
-// the next Finalize, so undoing an adoption also retracts the
-// reference decisions that depended on it.
-func (m *MergeSession) UndoRegion(region string) error {
+// made inside that region; other regions' adoption records are left
+// untouched. Reference consequences are recomputed at the next
+// Finalize, so undoing an adoption also retracts the reference
+// decisions that depended on it: the returned list names exactly
+// which reference decisions the undo invalidated.
+func (m *MergeSession) UndoRegion(region string) ([]PendingReference, error) {
 	if !m.adoptedRegions[region] {
-		return fmt.Errorf("savecore: region %q was not adopted", region)
+		return nil, fmt.Errorf("savecore: region %q was not adopted", region)
+	}
+	before, err := m.referenceDecisions()
+	if err != nil {
+		return nil, err
 	}
 	delete(m.adoptedRegions, region)
 	for _, od := range m.diff.Regions[region] {
 		delete(m.decisions, od.StableID)
 	}
-	return m.persist()
+	if err := m.persist(); err != nil {
+		return nil, err
+	}
+	after, err := m.referenceDecisions()
+	if err != nil {
+		return nil, err
+	}
+	stillValid := map[string]bool{}
+	for _, pr := range after {
+		stillValid[pr.From+"->"+pr.To] = true
+	}
+	var invalidated []PendingReference
+	for _, pr := range before {
+		if !stillValid[pr.From+"->"+pr.To] {
+			invalidated = append(invalidated, pr)
+		}
+	}
+	return invalidated, nil
+}
+
+// referenceDecisions computes the reference rescues the current
+// decision state would produce, without writing anything.
+func (m *MergeSession) referenceDecisions() ([]PendingReference, error) {
+	_, _, report, err := m.plan()
+	if err != nil {
+		return nil, err
+	}
+	return report.PendingReferences, nil
 }
 
 // Resolve records the operator's choice for one conflicting object.
@@ -263,11 +296,10 @@ func (m *MergeSession) autoResolve(od *ObjectDiff) chosenState {
 	}
 }
 
-// Finalize assembles the merged save and writes it to the output
-// store. Undecided objects fall back to their base version (or stay
-// excluded if they are new), and the report names every one of them:
-// the official save never claims a complete merge it did not do.
-func (m *MergeSession) Finalize() (*MergeReport, error) {
+// plan computes the merge outcome — the winning state per object and
+// the honest report — without writing anything. Finalize and the
+// checkpoint snapshots both build on it.
+func (m *MergeSession) plan() (map[string]*chosenState, []string, *MergeReport, error) {
 	report := &MergeReport{Complete: true}
 	chosen := map[string]*chosenState{}
 
@@ -366,7 +398,7 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 						bs = src.states[target]
 					}
 					if bs == nil {
-						return nil, fmt.Errorf("savecore: reference %s -> %s has no rescue source", sid, target)
+						return nil, nil, nil, fmt.Errorf("savecore: reference %s -> %s has no rescue source", sid, target)
 					}
 					rescueSrc = src
 				}
@@ -381,6 +413,46 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 		if !missing {
 			break
 		}
+	}
+
+	for r := range m.adoptedRegions {
+		report.AdoptedRegions = append(report.AdoptedRegions, r)
+	}
+	sort.Strings(report.AdoptedRegions)
+	// A branch-new object first listed as an unadopted exclusion may
+	// have been pulled back in by the reference-rescue pass; keep one
+	// consistent story instead of reporting it both excluded and kept.
+	if len(report.PendingReferences) > 0 {
+		rescued := map[string]bool{}
+		for _, pr := range report.PendingReferences {
+			rescued[pr.To] = true
+		}
+		kept := report.PendingObjects[:0]
+		for _, po := range report.PendingObjects {
+			if po.Kept == "excluded" && rescued[po.StableID] {
+				continue
+			}
+			kept = append(kept, po)
+		}
+		report.PendingObjects = kept
+	}
+	sort.Slice(report.PendingObjects, func(i, j int) bool {
+		return report.PendingObjects[i].StableID < report.PendingObjects[j].StableID
+	})
+	sort.Slice(report.PendingReferences, func(i, j int) bool {
+		return report.PendingReferences[i].To < report.PendingReferences[j].To
+	})
+	return chosen, sorted, report, nil
+}
+
+// Finalize assembles the merged save and writes it to the output
+// store. Undecided objects fall back to their base version (or stay
+// excluded if they are new), and the report names every one of them:
+// the official save never claims a complete merge it did not do.
+func (m *MergeSession) Finalize() (*MergeReport, error) {
+	chosen, sorted, report, err := m.plan()
+	if err != nil {
+		return nil, err
 	}
 
 	// Assemble the merged flat graph with fresh local node ids.
@@ -410,33 +482,6 @@ func (m *MergeSession) Finalize() (*MergeReport, error) {
 	}
 	merged.Root = rootID
 
-	for r := range m.adoptedRegions {
-		report.AdoptedRegions = append(report.AdoptedRegions, r)
-	}
-	sort.Strings(report.AdoptedRegions)
-	// A branch-new object first listed as an unadopted exclusion may
-	// have been pulled back in by the reference-rescue pass; keep one
-	// consistent story instead of reporting it both excluded and kept.
-	if len(report.PendingReferences) > 0 {
-		rescued := map[string]bool{}
-		for _, pr := range report.PendingReferences {
-			rescued[pr.To] = true
-		}
-		kept := report.PendingObjects[:0]
-		for _, po := range report.PendingObjects {
-			if po.Kept == "excluded" && rescued[po.StableID] {
-				continue
-			}
-			kept = append(kept, po)
-		}
-		report.PendingObjects = kept
-	}
-	sort.Slice(report.PendingObjects, func(i, j int) bool {
-		return report.PendingObjects[i].StableID < report.PendingObjects[j].StableID
-	})
-	sort.Slice(report.PendingReferences, func(i, j int) bool {
-		return report.PendingReferences[i].To < report.PendingReferences[j].To
-	})
 	merged.Extra["merge"] = report
 
 	payload, err := merged.Unflatten()

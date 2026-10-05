@@ -53,6 +53,13 @@
   区域，再 Resolve 逐个处理冲突；UndoRegion 只撤回对应区域及其引用
   后果。每次决定立即落盘（<输出>.merge.json），中断后
   ResumeMergeSession 继续；候选文件从不被改写，始终可恢复。
+- 审核检查点（savecore/checkpoint.go）：SaveCheckpoint 把当前审核状态
+  ——已采用区域、待处理对象、引用决定——按名字快照到
+  <输出>.merge.checkpoints.json；之后的会话里 DiffCheckpoints 比较两个
+  检查点（区域增减、决定变更、新增/消失的待处理对象、失效的引用决定），
+  RestoreCheckpoint 把会话审核状态回滚到任一检查点，只写会话状态文件，
+  从不动候选存档。UndoRegion 撤回某一区域时返回随之失效的引用决定清单，
+  其他区域的采用记录原样保留。
 - 正式存档不谎报：Finalize 始终写出可加载的存档，未采用的内容回退
   到 base 版本，并在存档内嵌的 merge 报告中逐一列明
   （pendingObjects / pendingReferences，complete=false）。被删除却仍
